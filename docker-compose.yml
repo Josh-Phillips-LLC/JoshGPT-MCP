@@ -7,5 +7,7 @@ services:
       - .env
     volumes:
       - "${JOSHGPT_MCP_WORKSPACE_HOST_PATH:-.}:/workspace:ro"
+      # Required only for run_container_command mode.
+      - "${JOSHGPT_MCP_DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock"
     ports:
       - "${JOSHGPT_MCP_PUBLISH_HOST:-127.0.0.1}:${JOSHGPT_MCP_PUBLISH_PORT:-8787}:${JOSHGPT_MCP_BIND_PORT:-8787}"

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """JoshGPT MCP server.
 
-Read-only MCP tools for local-agent workflows:
-- list_files
-- read_file
-- search_text
+Tool groups:
+- Read-only file tools:
+  - list_files
+  - read_file
+  - search_text
+- Optional execution tools (env-policy controlled):
+  - run_host_command
+  - run_container_command
 
-All tool paths are constrained to configured allow-roots.
+Execution tools are disabled by default via JOSHGPT_MCP_TOOLS_MODE=read-only.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +38,28 @@ DEFAULT_MAX_FILE_BYTES = 512_000
 DEFAULT_MAX_LIST_ENTRIES = 500
 DEFAULT_MAX_SEARCH_MATCHES = 500
 
+DEFAULT_TOOLS_MODE = "read-only"
+ALLOWED_TOOLS_MODES = {"read-only", "host", "container", "both"}
+
+DEFAULT_ALLOWED_HOST_COMMANDS = (
+    "ls,cat,rg,grep,find,pwd,echo,git,gh,python,python3,"
+    "sed,awk,head,tail,wc,stat,uname,date,id,whoami"
+)
+DEFAULT_ALLOWED_CONTAINER_COMMANDS = (
+    "ls,cat,rg,grep,find,pwd,echo,git,gh,python,python3,"
+    "sed,awk,head,tail,wc,stat,uname,date,id,whoami"
+)
+DEFAULT_ALLOWED_CONTAINERS = ""
+DEFAULT_REQUIRE_CONTAINER_RUNNING = True
+
+DEFAULT_DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
+DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS = 120
+DEFAULT_DEFAULT_COMMAND_OUTPUT_CHARS = 12_000
+DEFAULT_MAX_COMMAND_OUTPUT_CHARS = 40_000
+DEFAULT_MAX_COMMAND_ARGS = 32
+DEFAULT_MAX_COMMAND_NAME_CHARS = 128
+DEFAULT_MAX_ARG_CHARS = 1024
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -47,6 +74,19 @@ def _env_int(name: str, default: int) -> int:
         print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
         return default
     return parsed
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
+    return default
 
 
 def _resolve_transport(raw_transport: str) -> str:
@@ -79,6 +119,22 @@ def _parse_deny_segments(raw_segments: str) -> set[str]:
     return set(_parse_csv(raw_segments))
 
 
+def _parse_tools_mode(raw_mode: str) -> str:
+    normalized = (raw_mode or "").strip().lower()
+    if normalized in ALLOWED_TOOLS_MODES:
+        return normalized
+    print(
+        f"Invalid JOSHGPT_MCP_TOOLS_MODE={raw_mode!r}; defaulting to {DEFAULT_TOOLS_MODE}.",
+        file=sys.stderr,
+    )
+    return DEFAULT_TOOLS_MODE
+
+
+def _parse_allowlist(raw: str) -> set[str]:
+    values = _parse_csv(raw)
+    return set(values)
+
+
 JOSHGPT_MCP_BIND_HOST = os.getenv("JOSHGPT_MCP_BIND_HOST", DEFAULT_BIND_HOST).strip() or DEFAULT_BIND_HOST
 JOSHGPT_MCP_BIND_PORT = _env_int("JOSHGPT_MCP_BIND_PORT", DEFAULT_BIND_PORT)
 JOSHGPT_MCP_TRANSPORT = _resolve_transport(os.getenv("JOSHGPT_MCP_TRANSPORT", DEFAULT_TRANSPORT))
@@ -92,6 +148,46 @@ JOSHGPT_MCP_DENY_SEGMENTS = _parse_deny_segments(
 JOSHGPT_MCP_MAX_FILE_BYTES = _env_int("JOSHGPT_MCP_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES)
 JOSHGPT_MCP_MAX_LIST_ENTRIES = _env_int("JOSHGPT_MCP_MAX_LIST_ENTRIES", DEFAULT_MAX_LIST_ENTRIES)
 JOSHGPT_MCP_MAX_SEARCH_MATCHES = _env_int("JOSHGPT_MCP_MAX_SEARCH_MATCHES", DEFAULT_MAX_SEARCH_MATCHES)
+
+JOSHGPT_MCP_TOOLS_MODE = _parse_tools_mode(os.getenv("JOSHGPT_MCP_TOOLS_MODE", DEFAULT_TOOLS_MODE))
+JOSHGPT_MCP_ALLOWED_HOST_COMMANDS = _parse_allowlist(
+    os.getenv("JOSHGPT_MCP_ALLOWED_HOST_COMMANDS", DEFAULT_ALLOWED_HOST_COMMANDS)
+)
+JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS = _parse_allowlist(
+    os.getenv("JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS", DEFAULT_ALLOWED_CONTAINER_COMMANDS)
+)
+JOSHGPT_MCP_ALLOWED_CONTAINERS = _parse_allowlist(
+    os.getenv("JOSHGPT_MCP_ALLOWED_CONTAINERS", DEFAULT_ALLOWED_CONTAINERS)
+)
+JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING = _env_bool(
+    "JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING", DEFAULT_REQUIRE_CONTAINER_RUNNING
+)
+
+JOSHGPT_MCP_DEFAULT_COMMAND_TIMEOUT_SECONDS = _env_int(
+    "JOSHGPT_MCP_DEFAULT_COMMAND_TIMEOUT_SECONDS",
+    DEFAULT_DEFAULT_COMMAND_TIMEOUT_SECONDS,
+)
+JOSHGPT_MCP_MAX_COMMAND_TIMEOUT_SECONDS = _env_int(
+    "JOSHGPT_MCP_MAX_COMMAND_TIMEOUT_SECONDS",
+    DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS,
+)
+JOSHGPT_MCP_DEFAULT_COMMAND_OUTPUT_CHARS = _env_int(
+    "JOSHGPT_MCP_DEFAULT_COMMAND_OUTPUT_CHARS",
+    DEFAULT_DEFAULT_COMMAND_OUTPUT_CHARS,
+)
+JOSHGPT_MCP_MAX_COMMAND_OUTPUT_CHARS = _env_int(
+    "JOSHGPT_MCP_MAX_COMMAND_OUTPUT_CHARS",
+    DEFAULT_MAX_COMMAND_OUTPUT_CHARS,
+)
+JOSHGPT_MCP_MAX_COMMAND_ARGS = _env_int(
+    "JOSHGPT_MCP_MAX_COMMAND_ARGS",
+    DEFAULT_MAX_COMMAND_ARGS,
+)
+JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS = _env_int(
+    "JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS",
+    DEFAULT_MAX_COMMAND_NAME_CHARS,
+)
+JOSHGPT_MCP_MAX_ARG_CHARS = _env_int("JOSHGPT_MCP_MAX_ARG_CHARS", DEFAULT_MAX_ARG_CHARS)
 
 mcp = FastMCP(
     "joshgpt-mcp",
@@ -179,6 +275,214 @@ def _safe_size(path: Path) -> int | None:
         return path.stat().st_size
     except OSError:
         return None
+
+
+def _mode_allows(tool_area: str) -> bool:
+    if JOSHGPT_MCP_TOOLS_MODE == "both":
+        return True
+    if JOSHGPT_MCP_TOOLS_MODE == "read-only":
+        return False
+    return JOSHGPT_MCP_TOOLS_MODE == tool_area
+
+
+def _assert_mode_allows(tool_area: str) -> None:
+    if _mode_allows(tool_area):
+        return
+    raise PermissionError(
+        f"Tool is disabled by JOSHGPT_MCP_TOOLS_MODE={JOSHGPT_MCP_TOOLS_MODE!r}. "
+        f"Required mode: {tool_area!r} or 'both'."
+    )
+
+
+def _has_forbidden_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 for ch in value)
+
+
+def _validate_command(command: str, allowlist: set[str], label: str) -> tuple[str, str]:
+    token = (command or "").strip()
+    if not token:
+        raise ValueError("command must not be empty")
+    if " " in token:
+        raise ValueError("command must be a single token (pass arguments via args)")
+    if "/" in token or "\\" in token:
+        raise ValueError("command must be a basename token (path separators are not allowed)")
+    if len(token) > JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS:
+        raise ValueError(
+            f"command exceeds max length ({JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS} chars)"
+        )
+    if _has_forbidden_control_chars(token):
+        raise ValueError("command contains forbidden control characters")
+
+    basename = Path(token).name
+    if basename in {"", ".", ".."}:
+        raise ValueError("command is invalid")
+
+    if "*" not in allowlist and basename not in allowlist:
+        allowed = ", ".join(sorted(allowlist)) if allowlist else "<empty>"
+        raise PermissionError(
+            f"{label} command not allowed: {basename!r}. "
+            f"Set {label} allowlist env var to permit it. Current allowlist: {allowed}"
+        )
+
+    return token, basename
+
+
+def _validate_args(args: list[str] | None) -> list[str]:
+    if args is None:
+        return []
+    if not isinstance(args, list):
+        raise ValueError("args must be an array of strings")
+    if len(args) > JOSHGPT_MCP_MAX_COMMAND_ARGS:
+        raise ValueError(f"args exceeds max count ({JOSHGPT_MCP_MAX_COMMAND_ARGS})")
+
+    cleaned: list[str] = []
+    for raw in args:
+        item = str(raw)
+        if _has_forbidden_control_chars(item):
+            raise ValueError("args contain forbidden control characters")
+        if len(item) > JOSHGPT_MCP_MAX_ARG_CHARS:
+            raise ValueError(
+                f"argument exceeds max length ({JOSHGPT_MCP_MAX_ARG_CHARS} chars)"
+            )
+        cleaned.append(item)
+    return cleaned
+
+
+def _bounded_timeout_seconds(requested: int | None) -> int:
+    if requested is None or requested <= 0:
+        return JOSHGPT_MCP_DEFAULT_COMMAND_TIMEOUT_SECONDS
+    return min(requested, JOSHGPT_MCP_MAX_COMMAND_TIMEOUT_SECONDS)
+
+
+def _bounded_output_chars(requested: int | None) -> int:
+    if requested is None or requested <= 0:
+        return JOSHGPT_MCP_DEFAULT_COMMAND_OUTPUT_CHARS
+    return min(requested, JOSHGPT_MCP_MAX_COMMAND_OUTPUT_CHARS)
+
+
+def _truncate_text(value: str, limit: int) -> tuple[str, bool]:
+    text = value or ""
+    if len(text) <= limit:
+        return text, False
+    suffix = "\n...[truncated]"
+    head_budget = max(0, limit - len(suffix))
+    return f"{text[:head_budget]}{suffix}", True
+
+
+def _coerce_timeout_partial(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _run_command(
+    argv: list[str],
+    *,
+    cwd: Path | None,
+    timeout_seconds: int,
+    max_output_chars: int,
+) -> dict[str, Any]:
+    started_at = time.time()
+    timed_out = False
+
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+        exit_code = completed.returncode
+        stdout_text = completed.stdout or ""
+        stderr_text = completed.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = 124
+        stdout_text = _coerce_timeout_partial(exc.stdout)
+        stderr_text = _coerce_timeout_partial(exc.stderr)
+
+    stdout_text, stdout_truncated = _truncate_text(stdout_text, max_output_chars)
+    stderr_text, stderr_truncated = _truncate_text(stderr_text, max_output_chars)
+
+    duration_ms = int((time.time() - started_at) * 1000)
+
+    return {
+        "argv": argv,
+        "cwd": str(cwd) if cwd else None,
+        "timeout_seconds": timeout_seconds,
+        "max_output_chars": max_output_chars,
+        "duration_ms": duration_ms,
+        "timed_out": timed_out,
+        "exit_code": exit_code,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+
+
+def _validate_container_name(container_name: str) -> str:
+    name = (container_name or "").strip()
+    if not name:
+        raise ValueError("container_name must not be empty")
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", name):
+        raise ValueError("container_name contains invalid characters")
+    if _has_forbidden_control_chars(name):
+        raise ValueError("container_name contains forbidden control characters")
+
+    if not JOSHGPT_MCP_ALLOWED_CONTAINERS:
+        raise PermissionError(
+            "JOSHGPT_MCP_ALLOWED_CONTAINERS is empty. "
+            "Add allowed container names (comma-separated) or '*' to permit all."
+        )
+
+    if "*" not in JOSHGPT_MCP_ALLOWED_CONTAINERS and name not in JOSHGPT_MCP_ALLOWED_CONTAINERS:
+        allowed = ", ".join(sorted(JOSHGPT_MCP_ALLOWED_CONTAINERS))
+        raise PermissionError(
+            f"Container not allowed: {name!r}. Allowed containers: {allowed}"
+        )
+
+    return name
+
+
+def _validate_container_workdir(raw_workdir: str) -> str | None:
+    workdir = (raw_workdir or "").strip()
+    if not workdir:
+        return None
+    if _has_forbidden_control_chars(workdir):
+        raise ValueError("container workdir contains forbidden control characters")
+    if not workdir.startswith("/"):
+        raise ValueError("container workdir must be an absolute path")
+    return workdir
+
+
+def _docker_bin() -> str:
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        raise RuntimeError(
+            "docker CLI is unavailable. Install docker CLI and ensure it is on PATH."
+        )
+    return docker_bin
+
+
+def _ensure_container_running(docker_bin: str, container_name: str) -> None:
+    completed = subprocess.run(
+        [docker_bin, "inspect", "-f", "{{.State.Running}}", container_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"Unable to inspect container {container_name!r}: {detail[:300]}")
+
+    state = (completed.stdout or "").strip().lower()
+    if state != "true":
+        raise RuntimeError(f"Container is not running: {container_name!r}")
 
 
 @mcp.tool()
@@ -363,6 +667,104 @@ def search_text(
 
 
 @mcp.tool()
+def run_host_command(
+    command: str,
+    args: list[str] | None = None,
+    cwd: str = ".",
+    timeout_seconds: int | None = None,
+    max_output_chars: int | None = None,
+) -> dict[str, Any]:
+    """Run an allowlisted command on the MCP host with bounded timeout/output."""
+
+    _assert_mode_allows("host")
+
+    command_token, basename = _validate_command(
+        command,
+        JOSHGPT_MCP_ALLOWED_HOST_COMMANDS,
+        "host",
+    )
+    cleaned_args = _validate_args(args)
+    resolved_cwd = _resolve_path(cwd, expect="dir")
+    executable = shutil.which(command_token)
+    if not executable:
+        raise FileNotFoundError(f"Host command not found on PATH: {command_token!r}")
+
+    timeout = _bounded_timeout_seconds(timeout_seconds)
+    output_limit = _bounded_output_chars(max_output_chars)
+
+    result = _run_command(
+        [executable, *cleaned_args],
+        cwd=resolved_cwd,
+        timeout_seconds=timeout,
+        max_output_chars=output_limit,
+    )
+
+    return {
+        "tool": "run_host_command",
+        "mode": JOSHGPT_MCP_TOOLS_MODE,
+        "command": basename,
+        "executable": executable,
+        "args": cleaned_args,
+        "cwd": str(resolved_cwd),
+        "result": result,
+    }
+
+
+@mcp.tool()
+def run_container_command(
+    container_name: str,
+    command: str,
+    args: list[str] | None = None,
+    workdir: str = "",
+    timeout_seconds: int | None = None,
+    max_output_chars: int | None = None,
+) -> dict[str, Any]:
+    """Run an allowlisted command inside an allowlisted container using docker exec."""
+
+    _assert_mode_allows("container")
+
+    validated_container = _validate_container_name(container_name)
+    command_token, basename = _validate_command(
+        command,
+        JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS,
+        "container",
+    )
+    cleaned_args = _validate_args(args)
+    validated_workdir = _validate_container_workdir(workdir)
+
+    docker_bin = _docker_bin()
+    if JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING:
+        _ensure_container_running(docker_bin, validated_container)
+
+    timeout = _bounded_timeout_seconds(timeout_seconds)
+    output_limit = _bounded_output_chars(max_output_chars)
+
+    docker_cmd = [docker_bin, "exec"]
+    if validated_workdir:
+        docker_cmd.extend(["-w", validated_workdir])
+    docker_cmd.append(validated_container)
+    docker_cmd.append(command_token)
+    docker_cmd.extend(cleaned_args)
+
+    result = _run_command(
+        docker_cmd,
+        cwd=None,
+        timeout_seconds=timeout,
+        max_output_chars=output_limit,
+    )
+
+    return {
+        "tool": "run_container_command",
+        "mode": JOSHGPT_MCP_TOOLS_MODE,
+        "container_name": validated_container,
+        "command": basename,
+        "args": cleaned_args,
+        "workdir": validated_workdir,
+        "result": result,
+    }
+
+
+@mcp.tool()
 def server_info() -> dict[str, Any]:
     """Expose active server limits and policy settings."""
 
@@ -376,6 +778,18 @@ def server_info() -> dict[str, Any]:
         "max_file_bytes": JOSHGPT_MCP_MAX_FILE_BYTES,
         "max_list_entries": JOSHGPT_MCP_MAX_LIST_ENTRIES,
         "max_search_matches": JOSHGPT_MCP_MAX_SEARCH_MATCHES,
+        "tools_mode": JOSHGPT_MCP_TOOLS_MODE,
+        "allowed_host_commands": sorted(JOSHGPT_MCP_ALLOWED_HOST_COMMANDS),
+        "allowed_container_commands": sorted(JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS),
+        "allowed_containers": sorted(JOSHGPT_MCP_ALLOWED_CONTAINERS),
+        "require_container_running": JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING,
+        "default_command_timeout_seconds": JOSHGPT_MCP_DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        "max_command_timeout_seconds": JOSHGPT_MCP_MAX_COMMAND_TIMEOUT_SECONDS,
+        "default_command_output_chars": JOSHGPT_MCP_DEFAULT_COMMAND_OUTPUT_CHARS,
+        "max_command_output_chars": JOSHGPT_MCP_MAX_COMMAND_OUTPUT_CHARS,
+        "max_command_args": JOSHGPT_MCP_MAX_COMMAND_ARGS,
+        "max_command_name_chars": JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS,
+        "max_arg_chars": JOSHGPT_MCP_MAX_ARG_CHARS,
     }
 
 
@@ -386,6 +800,7 @@ if __name__ == "__main__":
             f"transport={JOSHGPT_MCP_TRANSPORT} "
             f"host={JOSHGPT_MCP_BIND_HOST} "
             f"port={JOSHGPT_MCP_BIND_PORT} "
+            f"mode={JOSHGPT_MCP_TOOLS_MODE} "
             f"allowed_roots={[str(root) for root in JOSHGPT_MCP_ALLOWED_ROOTS]}"
         ),
         flush=True,
