@@ -90,6 +90,7 @@ python src/joshgpt_mcp_server.py
 - Search uses `ripgrep` (`rg`) when available.
 - Execution tools are blocked unless enabled by `JOSHGPT_MCP_TOOLS_MODE`.
 - Execution tools enforce command allowlists, timeout bounds, and output truncation.
+- Execution tools accept command **basename tokens only** (for example `git`, not `/usr/bin/git`).
 - `run_container_command` additionally enforces container allowlist and (by default) running-state checks.
 
 ## Smoke Checks

@@ -304,6 +304,8 @@ def _validate_command(command: str, allowlist: set[str], label: str) -> tuple[st
         raise ValueError("command must not be empty")
     if " " in token:
         raise ValueError("command must be a single token (pass arguments via args)")
+    if "/" in token or "\\" in token:
+        raise ValueError("command must be a basename token (path separators are not allowed)")
     if len(token) > JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS:
         raise ValueError(
             f"command exceeds max length ({JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS} chars)"
@@ -683,13 +685,9 @@ def run_host_command(
     )
     cleaned_args = _validate_args(args)
     resolved_cwd = _resolve_path(cwd, expect="dir")
-
-    if "/" in command_token:
-        executable = command_token
-    else:
-        executable = shutil.which(command_token)
-        if not executable:
-            raise FileNotFoundError(f"Host command not found on PATH: {command_token!r}")
+    executable = shutil.which(command_token)
+    if not executable:
+        raise FileNotFoundError(f"Host command not found on PATH: {command_token!r}")
 
     timeout = _bounded_timeout_seconds(timeout_seconds)
     output_limit = _bounded_output_chars(max_output_chars)
