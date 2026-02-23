@@ -6,13 +6,19 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ripgrep docker-cli \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ripgrep \
+        docker-cli \
+        sqlite3 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
+COPY contracts ./contracts
 COPY .env.example ./
 
 CMD ["python", "src/joshgpt_mcp_server.py"]

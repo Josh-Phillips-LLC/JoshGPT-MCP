@@ -1,12 +1,43 @@
 # JoshGPT-MCP
 
-Containerized MCP server for JoshGPT tool execution.
+Containerized MCP services for JoshGPT tool execution and role-routed orchestration.
 
 ## Purpose
 
-This repository hosts the MCP tool server that local agents (for example JoshGPT in VS Code) can call for governed local operations.
+This repository now contains three runtime services:
 
-Current toolset:
+1. `joshgpt-mcp` (tool-host)
+   - file/search tools
+   - optional command execution tools
+2. `joshgpt-dispatcher` (capability)
+   - task routing/state for role workers
+   - supervisor question/response linkage
+3. `joshgpt-supervisor-capability` (capability)
+   - context-agnostic supervisor decision engine
+   - requires role-context injection from caller
+
+The role mission context remains with workers/roles, not with dispatcher/supervisor capabilities.
+
+## Architecture
+
+- Single repo, separated services/containers.
+- Dispatcher and supervisor are **capabilities**, not roles.
+- Supervisor capability is contract-driven and context-agnostic.
+- Role workers are expected to inject role context in supervisor requests.
+
+## Contracts
+
+Versioned supervisor schemas:
+
+- `contracts/supervisor/v1/request.schema.json`
+- `contracts/supervisor/v1/response.schema.json`
+
+Fail-closed rule:
+- If role context is missing or ambiguous, supervisor capability returns a deterministic refusal (`status=refused`, `decision=deny`).
+
+## Services and Tools
+
+### 1) Tool-host (`joshgpt-mcp`)
 
 Read-only:
 - `list_files`
@@ -18,25 +49,36 @@ Execution (policy-gated):
 - `run_host_command`
 - `run_container_command`
 
+### 2) Dispatcher (`joshgpt-dispatcher`)
+
+- `dispatch_role_task`
+- `claim_next_task`
+- `set_task_status`
+- `submit_supervisor_question`
+- `list_pending_supervisor_questions`
+- `respond_supervisor_question`
+- `get_task_status`
+- `list_role_queues`
+- `dispatcher_info`
+
+### 3) Supervisor capability (`joshgpt-supervisor-capability`)
+
+- `ask_supervisor_capability`
+
 ## Quick Start
 
 ```bash
 cp .env.example .env
+# set shared tokens before start
 
-# Build and run
-docker compose up --build
+docker compose up --build -d
+docker compose ps
 ```
 
-Default mode is read-only. To enable execution tools, update `.env`:
-
-```bash
-# host execution only
-JOSHGPT_MCP_TOOLS_MODE=host
-
-# or host + container execution
-JOSHGPT_MCP_TOOLS_MODE=both
-JOSHGPT_MCP_ALLOWED_CONTAINERS=implementation-workstation,compliance-workstation,systems-architect-workstation,hr-ai-agent-specialist-workstation
-```
+Default ports:
+- Tool-host: `127.0.0.1:8787`
+- Dispatcher: `127.0.0.1:8788`
+- Supervisor capability: `127.0.0.1:8789`
 
 ## Local Run (without Docker)
 
@@ -44,57 +86,55 @@ JOSHGPT_MCP_ALLOWED_CONTAINERS=implementation-workstation,compliance-workstation
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# tool-host
 python src/joshgpt_mcp_server.py
+
+# dispatcher (separate terminal)
+python src/dispatcher_mcp_server.py
+
+# supervisor capability (separate terminal)
+python src/supervisor_capability_server.py
 ```
 
 ## Environment
 
-### Runtime
+### Tool-host
+- `JOSHGPT_MCP_*` variables in `.env.example`
 
-- `JOSHGPT_MCP_BIND_HOST`: Bind host for MCP runtime (default: `0.0.0.0`)
-- `JOSHGPT_MCP_BIND_PORT`: Bind port for MCP runtime (default: `8787`)
-- `JOSHGPT_MCP_TRANSPORT`: MCP transport (`stdio`, `sse`, `streamable-http`; default: `streamable-http`)
+### Dispatcher
+- `JOSHGPT_DISPATCHER_BIND_HOST`
+- `JOSHGPT_DISPATCHER_BIND_PORT`
+- `JOSHGPT_DISPATCHER_TRANSPORT`
+- `JOSHGPT_DISPATCHER_PUBLISH_HOST`
+- `JOSHGPT_DISPATCHER_PUBLISH_PORT`
+- `JOSHGPT_DISPATCHER_DB_PATH`
+- `JOSHGPT_DISPATCHER_REQUIRE_SHARED_TOKEN`
+- `JOSHGPT_DISPATCHER_SHARED_TOKEN`
 
-### Docker Publish
-
-- `JOSHGPT_MCP_PUBLISH_HOST`: Host interface for exposed container port (default: `127.0.0.1`)
-- `JOSHGPT_MCP_PUBLISH_PORT`: Host port mapped to MCP bind port (default: `8787`)
-- `JOSHGPT_MCP_WORKSPACE_HOST_PATH`: Host path mounted into container as `/workspace` (default: `.`)
-- `JOSHGPT_MCP_DOCKER_SOCKET_PATH`: Host socket mapped to `/var/run/docker.sock` for container execution tools (default: `/var/run/docker.sock`)
-
-### Policy + Limits
-
-- `JOSHGPT_MCP_ALLOWED_ROOTS`: Comma-separated allowed root paths inside container (default: `/workspace`)
-- `JOSHGPT_MCP_DENY_SEGMENTS`: Denied path segments (default includes `.git`, `node_modules`, `.ssh`, etc.)
-- `JOSHGPT_MCP_MAX_FILE_BYTES`: Max bytes allowed for `read_file` (default: `512000`)
-- `JOSHGPT_MCP_MAX_LIST_ENTRIES`: Max returned entries for `list_files` (default: `500`)
-- `JOSHGPT_MCP_MAX_SEARCH_MATCHES`: Max returned matches for `search_text` (default: `500`)
-- `JOSHGPT_MCP_TOOLS_MODE`: `read-only` | `host` | `container` | `both` (default: `read-only`)
-- `JOSHGPT_MCP_ALLOWED_HOST_COMMANDS`: Host command allowlist by command basename (comma-separated)
-- `JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS`: Container command allowlist by command basename
-- `JOSHGPT_MCP_ALLOWED_CONTAINERS`: Allowed container names (comma-separated, `*` for all)
-- `JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING`: Require target container to be running before `docker exec`
-- `JOSHGPT_MCP_DEFAULT_COMMAND_TIMEOUT_SECONDS`: Default timeout for execution tools
-- `JOSHGPT_MCP_MAX_COMMAND_TIMEOUT_SECONDS`: Hard timeout cap for execution tools
-- `JOSHGPT_MCP_DEFAULT_COMMAND_OUTPUT_CHARS`: Default max chars for stdout/stderr
-- `JOSHGPT_MCP_MAX_COMMAND_OUTPUT_CHARS`: Hard output cap for stdout/stderr
-- `JOSHGPT_MCP_MAX_COMMAND_ARGS`: Max args count accepted by execution tools
-- `JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS`: Max length for command token
-- `JOSHGPT_MCP_MAX_ARG_CHARS`: Max length for each argument
-
-## Tool Behavior
-
-- All tool paths are resolved against `JOSHGPT_MCP_ALLOWED_ROOTS`.
-- Requests outside allow-roots are rejected.
-- Paths containing denied segments are rejected.
-- Search uses `ripgrep` (`rg`) when available.
-- Execution tools are blocked unless enabled by `JOSHGPT_MCP_TOOLS_MODE`.
-- Execution tools enforce command allowlists, timeout bounds, and output truncation.
-- Execution tools accept command **basename tokens only** (for example `git`, not `/usr/bin/git`).
-- `run_container_command` additionally enforces container allowlist and (by default) running-state checks.
+### Supervisor capability
+- `JOSHGPT_SUPERVISOR_BIND_HOST`
+- `JOSHGPT_SUPERVISOR_BIND_PORT`
+- `JOSHGPT_SUPERVISOR_TRANSPORT`
+- `JOSHGPT_SUPERVISOR_PUBLISH_HOST`
+- `JOSHGPT_SUPERVISOR_PUBLISH_PORT`
+- `JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN`
+- `JOSHGPT_SUPERVISOR_SHARED_TOKEN`
+- `JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE`
 
 ## Smoke Checks
 
 ```bash
-python3 -m py_compile src/joshgpt_mcp_server.py
+python3 -m py_compile src/joshgpt_mcp_server.py src/dispatcher_mcp_server.py src/supervisor_capability_server.py
 ```
+
+```bash
+docker compose logs --tail=100 joshgpt-dispatcher
+docker compose logs --tail=100 joshgpt-supervisor-capability
+```
+
+## Notes
+
+- Dispatcher uses SQLite for MVP state.
+- Shared token protection is enabled by default for dispatcher and supervisor tools.
+- This repo currently defines capability services and contracts; role-worker runtime integration remains a separate implementation phase.

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joshgpt/contracts/supervisor/v1/request.schema.json",
+  "title": "Supervisor Capability Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "task_id",
+    "worker_role_slug",
+    "supervisor_role_slug",
+    "escalation_reason",
+    "question",
+    "role_context",
+    "task_context"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "worker_role_slug": {
+      "type": "string",
+      "minLength": 1
+    },
+    "supervisor_role_slug": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requested_decision": {
+      "type": "string",
+      "enum": ["auto", "allow", "deny", "clarify", "escalate"],
+      "default": "auto"
+    },
+    "escalation_reason": {
+      "type": "string",
+      "enum": [
+        "instruction_ambiguity",
+        "missing_required_input",
+        "authority_conflict",
+        "quality_risk",
+        "execution_blocker",
+        "other"
+      ]
+    },
+    "question": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role_slug",
+        "role_job_description_ref",
+        "role_job_description_sha256",
+        "constraints"
+      ],
+      "properties": {
+        "role_slug": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_job_description_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_job_description_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "authority_boundaries": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "quality_standards": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        }
+      }
+    },
+    "task_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective"],
+      "properties": {
+        "objective": {
+          "type": "string",
+          "minLength": 1
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "input_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      },
+      "default": {}
+    }
+  }
+}
