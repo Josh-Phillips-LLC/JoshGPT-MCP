@@ -321,12 +321,30 @@ def parse_args() -> argparse.Namespace:
         default="deterministic decisions",
         help="Comma-separated role quality standards",
     )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print concise key=value summary instead of full JSON payload.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     output = anyio.run(run_smoke, args)
+    if args.summary_only:
+        print(f"task_id={output['dispatched']['task_id']}")
+        print(f"message_id={output['question']['message_id']}")
+        print(f"decision={output['supervisor_decision']['decision']}")
+        print(f"status={output['task_status']['task']['status']}")
+        print(
+            "flow_passed="
+            + ("yes" if output["responded"]["status"] == "answered" else "no")
+        )
+        escalate_to = output["supervisor_decision"].get("escalate_to_role_slug")
+        if escalate_to:
+            print(f"escalate_to_role_slug={escalate_to}")
+        return
     print(json.dumps(output, indent=2))
 
 
