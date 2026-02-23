@@ -1,7 +1,10 @@
+name: jgp
+
 services:
-  joshgpt-mcp:
+  toolhost:
     build: .
-    container_name: joshgpt-mcp
+    image: joshgpt/toolhost:dev
+    container_name: jgp-toolhost
     restart: unless-stopped
     env_file:
       - .env
@@ -12,15 +15,16 @@ services:
     ports:
       - "${JOSHGPT_MCP_PUBLISH_HOST:-127.0.0.1}:${JOSHGPT_MCP_PUBLISH_PORT:-8787}:${JOSHGPT_MCP_BIND_PORT:-8787}"
 
-  joshgpt-dispatcher:
+  dispatcher:
     build: .
-    container_name: joshgpt-dispatcher
+    image: joshgpt/dispatcher:dev
+    container_name: jgp-dispatcher
     restart: unless-stopped
     env_file:
       - .env
     command: ["python", "src/dispatcher_mcp_server.py"]
     volumes:
-      - "${JOSHGPT_DISPATCHER_DB_VOLUME:-joshgpt-dispatcher-data}:/data"
+      - "${JOSHGPT_DISPATCHER_DB_VOLUME:-jgp-dispatcher-data}:/data"
     environment:
       - JOSHGPT_DISPATCHER_BIND_HOST=${JOSHGPT_DISPATCHER_BIND_HOST:-0.0.0.0}
       - JOSHGPT_DISPATCHER_BIND_PORT=${JOSHGPT_DISPATCHER_BIND_PORT:-8788}
@@ -31,9 +35,10 @@ services:
     ports:
       - "${JOSHGPT_DISPATCHER_PUBLISH_HOST:-127.0.0.1}:${JOSHGPT_DISPATCHER_PUBLISH_PORT:-8788}:${JOSHGPT_DISPATCHER_BIND_PORT:-8788}"
 
-  joshgpt-supervisor-capability:
+  supervisor:
     build: .
-    container_name: joshgpt-supervisor-capability
+    image: joshgpt/supervisor:dev
+    container_name: jgp-supervisor
     restart: unless-stopped
     env_file:
       - .env
@@ -49,4 +54,4 @@ services:
       - "${JOSHGPT_SUPERVISOR_PUBLISH_HOST:-127.0.0.1}:${JOSHGPT_SUPERVISOR_PUBLISH_PORT:-8789}:${JOSHGPT_SUPERVISOR_BIND_PORT:-8789}"
 
 volumes:
-  joshgpt-dispatcher-data:
+  jgp-dispatcher-data:

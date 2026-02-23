@@ -6,13 +6,13 @@ Containerized MCP services for JoshGPT tool execution and role-routed orchestrat
 
 This repository now contains three runtime services:
 
-1. `joshgpt-mcp` (tool-host)
+1. `toolhost` (tool-host)
    - file/search tools
    - optional command execution tools
-2. `joshgpt-dispatcher` (capability)
+2. `dispatcher` (capability)
    - task routing/state for role workers
    - supervisor question/response linkage
-3. `joshgpt-supervisor-capability` (capability)
+3. `supervisor` (capability)
    - context-agnostic supervisor decision engine
    - requires role-context injection from caller
 
@@ -37,7 +37,7 @@ Fail-closed rule:
 
 ## Services and Tools
 
-### 1) Tool-host (`joshgpt-mcp`)
+### 1) Tool-host (`toolhost`)
 
 Read-only:
 - `list_files`
@@ -49,7 +49,7 @@ Execution (policy-gated):
 - `run_host_command`
 - `run_container_command`
 
-### 2) Dispatcher (`joshgpt-dispatcher`)
+### 2) Dispatcher (`dispatcher`)
 
 - `dispatch_role_task`
 - `claim_next_task`
@@ -61,7 +61,7 @@ Execution (policy-gated):
 - `list_role_queues`
 - `dispatcher_info`
 
-### 3) Supervisor capability (`joshgpt-supervisor-capability`)
+### 3) Supervisor capability (`supervisor`)
 
 - `ask_supervisor_capability`
 
@@ -129,8 +129,8 @@ python3 -m py_compile src/joshgpt_mcp_server.py src/dispatcher_mcp_server.py src
 ```
 
 ```bash
-docker compose logs --tail=100 joshgpt-dispatcher
-docker compose logs --tail=100 joshgpt-supervisor-capability
+docker compose logs --tail=100 dispatcher
+docker compose logs --tail=100 supervisor
 ```
 
 ### End-to-End Role/Supervisor Loop (MCP-only)
