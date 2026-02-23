@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joshgpt/contracts/supervisor/v1/response.schema.json",
+  "title": "Supervisor Capability Response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "task_id",
+    "decision_id",
+    "status",
+    "decision",
+    "rationale",
+    "constraints_to_apply",
+    "questions_for_worker",
+    "created_at"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "refused"]
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "deny", "clarify", "escalate"]
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "constraints_to_apply": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "questions_for_worker": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "escalate_to_role_slug": {
+      "type": ["string", "null"]
+    },
+    "refusal_reason": {
+      "type": ["string", "null"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      },
+      "default": {}
+    }
+  }
+}
