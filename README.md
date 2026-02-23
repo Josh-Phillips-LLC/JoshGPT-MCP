@@ -133,6 +133,34 @@ docker compose logs --tail=100 joshgpt-dispatcher
 docker compose logs --tail=100 joshgpt-supervisor-capability
 ```
 
+### End-to-End Role/Supervisor Loop (MCP-only)
+
+Run the reference smoke script from repo root:
+
+```bash
+.venv/bin/python scripts/smoke_worker_supervisor_loop.py
+```
+
+Optional example with explicit tokens/endpoints:
+
+```bash
+.venv/bin/python scripts/smoke_worker_supervisor_loop.py \
+  --dispatcher-url http://127.0.0.1:8788/mcp \
+  --supervisor-url http://127.0.0.1:8789/mcp \
+  --dispatcher-shared-token replace-me-dispatcher-token \
+  --supervisor-shared-token replace-me-supervisor-token \
+  --worker-role-slug implementation-specialist \
+  --supervisor-role-slug hr-ai-agent-specialist
+```
+
+The script executes this sequence strictly via MCP tool calls:
+- dispatch task
+- claim task
+- submit supervisor question
+- call supervisor capability
+- record supervisor response
+- fetch final task status/events
+
 ## Notes
 
 - Dispatcher uses SQLite for MVP state.
