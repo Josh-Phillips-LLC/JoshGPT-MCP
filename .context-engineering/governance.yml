@@ -1,0 +1,20 @@
+schema_version: "1.0"
+repository: "Josh-Phillips-LLC/JoshGPT-MCP"
+
+governance:
+  owner_system: "Context-Engineering"
+  owner_repo: "Josh-Phillips-LLC/Context-Engineering"
+  state: "transition"
+  registry_ref: "00-os/governed-repos.yml"
+  policy_ref: "governance.md#repository-governance-adoption-model-ownership-states"
+
+controls:
+  profile: "transition"
+  required_reviews:
+    - "Compliance Officer"
+
+evidence:
+  adoption_issue: "https://github.com/Josh-Phillips-LLC/Context-Engineering/issues/18"
+  rollout_issue: "https://github.com/Josh-Phillips-LLC/Context-Engineering/issues/18"
+
+last_reviewed_utc: "2026-02-25T00:00:00Z"

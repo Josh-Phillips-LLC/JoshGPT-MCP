@@ -1,0 +1,81 @@
+name: governance-pr-gates
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  governance-pr-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR metadata and labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const body = pr.body || "";
+            const labels = (pr.labels || []).map((label) => label.name || "");
+            const errors = [];
+
+            const requiredKeys = [
+              "Primary-Role:",
+              "Reviewed-By-Role:",
+              "Executive-Sponsor-Approval:",
+            ];
+
+            for (const key of requiredKeys) {
+              if (!body.includes(key)) {
+                errors.push(`Missing required PR metadata key: ${key}`);
+              }
+            }
+
+            function extractValue(key) {
+              const line = body
+                .split(/\r?\n/)
+                .find((entry) => entry.trim().startsWith(key));
+              if (!line) return "";
+              return line.slice(line.indexOf(":") + 1).trim();
+            }
+
+            const primaryRole = extractValue("Primary-Role:");
+            const reviewedByRole = extractValue("Reviewed-By-Role:");
+            const execApproval = extractValue("Executive-Sponsor-Approval:");
+
+            const allowedPrimaryRoles = [
+              "Executive Sponsor",
+              "AI Governance Manager",
+              "Compliance Officer",
+              "Business Analyst",
+              "Implementation Specialist",
+              "Systems Architect",
+            ];
+            const allowedReviewedByRoles = ["Compliance Officer", "Executive Sponsor", "N/A"];
+            const allowedExecApproval = ["Required", "Not-Required", "Provided"];
+
+            if (primaryRole && !allowedPrimaryRoles.includes(primaryRole)) {
+              errors.push(`Invalid Primary-Role value: \"${primaryRole}\"`);
+            }
+            if (reviewedByRole && !allowedReviewedByRoles.includes(reviewedByRole)) {
+              errors.push(`Invalid Reviewed-By-Role value: \"${reviewedByRole}\"`);
+            }
+            if (execApproval && !allowedExecApproval.includes(execApproval)) {
+              errors.push(`Invalid Executive-Sponsor-Approval value: \"${execApproval}\"`);
+            }
+
+            const roleLabels = labels.filter((name) => name.startsWith("role:"));
+            const statusLabels = labels.filter((name) => name.startsWith("status:"));
+
+            if (roleLabels.length < 1) {
+              errors.push("Missing role label: add at least one label with prefix role:");
+            }
+            if (statusLabels.length !== 1) {
+              errors.push(`Invalid status labels: expected exactly 1 label with prefix status:, found ${statusLabels.length}`);
+            }
+
+            if (errors.length > 0) {
+              core.setFailed(errors.join("\n"));
+            }
