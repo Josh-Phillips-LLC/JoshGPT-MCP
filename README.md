@@ -4,7 +4,7 @@ Containerized MCP services for JoshGPT tool execution and role-routed orchestrat
 
 ## Purpose
 
-This repository now contains three runtime services:
+This repository contains three runtime services:
 
 1. `toolhost` (tool-host)
    - file/search tools
@@ -13,27 +13,26 @@ This repository now contains three runtime services:
    - task routing/state for role workers
    - supervisor question/response linkage
 3. `supervisor` (capability)
-   - context-agnostic supervisor decision engine
-   - requires role-context injection from caller
-
-The role mission context remains with workers/roles, not with dispatcher/supervisor capabilities.
+   - canonical Codex supervisor decision engine (`ask_codex_supervisor`)
+   - Codex CLI-backed in this phase
 
 ## Architecture
 
 - Single repo, separated services/containers.
-- Dispatcher and supervisor are **capabilities**, not roles.
-- Supervisor capability is contract-driven and context-agnostic.
-- Role workers are expected to inject role context in supervisor requests.
+- Dispatcher and supervisor are capabilities, not roles.
+- Supervisor capability uses canonical `ask-codex-supervisor` contracts.
+- Role workers inject escalation payloads and consume supervisor decisions.
 
 ## Contracts
 
-Versioned supervisor schemas:
+Canonical supervisor schemas:
 
-- `contracts/supervisor/v1/request.schema.json`
-- `contracts/supervisor/v1/response.schema.json`
+- `contracts/ask-codex-supervisor.request.schema.json`
+- `contracts/ask-codex-supervisor.response.schema.json`
+- `contracts/ask-codex-supervisor.tool.json`
 
-Fail-closed rule:
-- If role context is missing or ambiguous, supervisor capability returns a deterministic refusal (`status=refused`, `decision=deny`).
+Fail-safe rule:
+- If payload validation or Codex runtime execution fails, supervisor returns a deterministic schema-valid `pause_for_human` response.
 
 ## Services and Tools
 
@@ -63,7 +62,7 @@ Execution (policy-gated):
 
 ### 3) Supervisor capability (`supervisor`)
 
-- `ask_supervisor_capability`
+- `ask_codex_supervisor`
 
 ## Quick Start
 
@@ -79,6 +78,15 @@ Default ports:
 - Tool-host: `127.0.0.1:8787`
 - Dispatcher: `127.0.0.1:8788`
 - Supervisor capability: `127.0.0.1:8789`
+
+## Codex CLI Login (Supervisor)
+
+Supervisor requires authenticated `codex` CLI session inside the supervisor runtime.
+
+```bash
+docker exec -it jgp-supervisor codex login --device-auth
+docker exec jgp-supervisor codex login status
+```
 
 ## Local Run (without Docker)
 
@@ -120,7 +128,10 @@ python src/supervisor_capability_server.py
 - `JOSHGPT_SUPERVISOR_PUBLISH_PORT`
 - `JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN`
 - `JOSHGPT_SUPERVISOR_SHARED_TOKEN`
-- `JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE`
+- `JOSHGPT_SUPERVISOR_CODEX_CLI_BIN`
+- `JOSHGPT_SUPERVISOR_CODEX_CLI_TIMEOUT_SECONDS`
+- `JOSHGPT_SUPERVISOR_CODEX_MODEL`
+- `JOSHGPT_SUPERVISOR_CODEX_STATE_VOLUME`
 
 ## Smoke Checks
 
@@ -135,10 +146,10 @@ docker compose logs --tail=100 supervisor
 
 ### End-to-End Role/Supervisor Loop (MCP-only)
 
-Run the reference smoke script from repo root:
+Run the canonical smoke script from repo root:
 
 ```bash
-.venv/bin/python scripts/smoke_worker_supervisor_loop.py
+.venv/bin/python scripts/smoke_worker_supervisor_loop.py --summary-only
 ```
 
 Optional example with explicit tokens/endpoints:
@@ -150,14 +161,15 @@ Optional example with explicit tokens/endpoints:
   --dispatcher-shared-token replace-me-dispatcher-token \
   --supervisor-shared-token replace-me-supervisor-token \
   --worker-role-slug implementation-specialist \
-  --supervisor-role-slug hr-ai-agent-specialist
+  --supervisor-role-slug hr-ai-agent-specialist \
+  --requested-decision next_step
 ```
 
-The script executes this sequence strictly via MCP tool calls:
+Script sequence:
 - dispatch task
 - claim task
 - submit supervisor question
-- call supervisor capability
+- call `ask_codex_supervisor`
 - record supervisor response
 - fetch final task status/events
 
@@ -165,4 +177,4 @@ The script executes this sequence strictly via MCP tool calls:
 
 - Dispatcher uses SQLite for MVP state.
 - Shared token protection is enabled by default for dispatcher and supervisor tools.
-- This repo currently defines capability services and contracts; role-worker runtime integration remains a separate implementation phase.
+- Supervisor backend is Codex CLI only in this phase.

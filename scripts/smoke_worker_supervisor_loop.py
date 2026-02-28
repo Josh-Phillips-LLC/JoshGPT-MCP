@@ -6,7 +6,7 @@ Flow:
 2. Worker role claims task.
 3. Worker submits supervisor question.
 4. Supervisor role lists pending questions.
-5. Supervisor capability returns deterministic decision.
+5. Codex supervisor capability returns canonical decision.
 6. Dispatcher records supervisor response.
 7. Fetch final task status/events for verification.
 """
@@ -101,11 +101,10 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     dispatcher_token = args.dispatcher_shared_token
     supervisor_token = args.supervisor_shared_token
 
-    constraints = _parse_csv(args.task_constraints)
-    input_refs = _parse_csv(args.task_input_refs)
-    role_constraints = _parse_csv(args.role_constraints)
-    authority_boundaries = _parse_csv(args.role_authority_boundaries)
-    quality_standards = _parse_csv(args.role_quality_standards)
+    task_constraints = _parse_csv(args.task_constraints)
+    task_input_refs = _parse_csv(args.task_input_refs)
+    attempt_history = _parse_csv(args.attempt_history)
+    scope_targets = _parse_csv(args.authorized_targets)
 
     role_context_ref = args.role_context_ref
     role_context_sha256 = (
@@ -113,8 +112,6 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         if args.role_context_sha256
         else hashlib.sha256(role_context_ref.encode("utf-8")).hexdigest()
     )
-
-    request_id = str(uuid.uuid4())
 
     async with McpToolClient(args.dispatcher_url) as dispatcher:
         dispatched = await dispatcher.call(
@@ -124,8 +121,8 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "worker_role_slug": args.worker_role_slug,
                     "supervisor_role_slug": args.supervisor_role_slug,
                     "objective": args.objective,
-                    "constraints": constraints,
-                    "input_refs": input_refs,
+                    "constraints": task_constraints,
+                    "input_refs": task_input_refs,
                 },
                 "shared_token": dispatcher_token,
             },
@@ -147,7 +144,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "task_id": task_id,
                 "from_role_slug": args.worker_role_slug,
                 "to_supervisor_role_slug": args.supervisor_role_slug,
-                "escalation_reason": args.escalation_reason,
+                "escalation_reason": args.dispatcher_escalation_reason,
                 "question": args.question,
                 "role_context_ref": role_context_ref,
                 "role_context_sha256": role_context_sha256,
@@ -163,32 +160,28 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
 
+    request_payload: dict[str, Any] = {
+        "mission_id": task_id,
+        "goal": args.objective,
+        "current_phase": args.current_phase,
+        "blocked_reason": args.blocked_reason,
+        "attempt_history": attempt_history,
+        "constraints": task_constraints,
+        "authorized_scope": {
+            "scope_id": args.authorized_scope_id,
+            "targets": scope_targets,
+            "expires_utc": args.authorized_expires_utc,
+        },
+        "requested_decision": args.requested_decision,
+    }
+    if args.evidence_summary.strip():
+        request_payload["evidence_summary"] = args.evidence_summary.strip()
+
     async with McpToolClient(args.supervisor_url) as supervisor:
         decision = await supervisor.call(
-            "ask_supervisor_capability",
+            "ask_codex_supervisor",
             {
-                "payload": {
-                    "request_id": request_id,
-                    "task_id": task_id,
-                    "worker_role_slug": args.worker_role_slug,
-                    "supervisor_role_slug": args.supervisor_role_slug,
-                    "requested_decision": args.requested_decision,
-                    "escalation_reason": args.escalation_reason,
-                    "question": args.question,
-                    "role_context": {
-                        "role_slug": args.supervisor_role_slug,
-                        "role_job_description_ref": role_context_ref,
-                        "role_job_description_sha256": role_context_sha256,
-                        "authority_boundaries": authority_boundaries,
-                        "constraints": role_constraints,
-                        "quality_standards": quality_standards,
-                    },
-                    "task_context": {
-                        "objective": args.objective,
-                        "constraints": constraints,
-                        "input_refs": input_refs,
-                    },
-                },
+                "payload": request_payload,
                 "shared_token": supervisor_token,
             },
         )
@@ -210,13 +203,13 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     return {
-        "request_id": request_id,
         "dispatcher_url": args.dispatcher_url,
         "supervisor_url": args.supervisor_url,
         "dispatched": dispatched,
         "claimed": claimed,
         "question": question,
         "pending_for_supervisor": pending,
+        "supervisor_request": request_payload,
         "supervisor_decision": decision,
         "responded": responded,
         "task_status": task_status,
@@ -273,8 +266,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated task input references",
     )
     parser.add_argument(
-        "--escalation-reason",
-        default="instruction_ambiguity",
+        "--dispatcher-escalation-reason",
+        default="execution_blocker",
         choices=[
             "instruction_ambiguity",
             "missing_required_input",
@@ -283,43 +276,71 @@ def parse_args() -> argparse.Namespace:
             "execution_blocker",
             "other",
         ],
-        help="Escalation reason for supervisor question",
+        help="Escalation reason stored in dispatcher supervisor question",
     )
     parser.add_argument(
         "--question",
-        default="Should this change use Refs or Closes in PR description?",
-        help="Supervisor question text",
+        default="Need supervisor decision on next best action for this blocked objective.",
+        help="Supervisor question text stored in dispatcher",
+    )
+    parser.add_argument(
+        "--current-phase",
+        default="validation",
+        choices=["discovery", "classification", "validation", "reporting"],
+        help="Current mission phase for ask_codex_supervisor request",
+    )
+    parser.add_argument(
+        "--blocked-reason",
+        default="ambiguous_result",
+        choices=[
+            "tool_error",
+            "ambiguous_result",
+            "policy_conflict",
+            "insufficient_context",
+            "repeated_failure",
+        ],
+        help="Blocked reason for ask_codex_supervisor request",
+    )
+    parser.add_argument(
+        "--attempt-history",
+        default="initial-run produced ambiguous output",
+        help="Comma-separated attempt history entries",
+    )
+    parser.add_argument(
+        "--evidence-summary",
+        default="Tool output did not converge on a single safe next step.",
+        help="Optional evidence summary for ask_codex_supervisor request",
+    )
+    parser.add_argument(
+        "--authorized-scope-id",
+        default="scope-supervised-smoke",
+        help="Authorized scope ID",
+    )
+    parser.add_argument(
+        "--authorized-targets",
+        default="workspace",
+        help="Comma-separated authorized scope targets",
+    )
+    parser.add_argument(
+        "--authorized-expires-utc",
+        default="2099-12-31T23:59:59Z",
+        help="Authorized scope expiration in UTC ISO8601 format",
     )
     parser.add_argument(
         "--requested-decision",
-        default="auto",
-        choices=["auto", "allow", "deny", "clarify", "escalate"],
-        help="Decision hint sent to supervisor capability",
+        default="next_step",
+        choices=["next_step", "prioritize", "deconflict", "stop_or_continue"],
+        help="Requested decision category for ask_codex_supervisor request",
     )
     parser.add_argument(
         "--role-context-ref",
-        default="AGENTS.md#hr-ai-agent-specialist",
-        help="Reference pointer to role context source",
+        default="AGENTS.md#implementation-specialist",
+        help="Reference pointer to role context source for dispatcher record",
     )
     parser.add_argument(
         "--role-context-sha256",
         default="",
         help="Optional explicit role context SHA256 (auto-generated from ref if omitted)",
-    )
-    parser.add_argument(
-        "--role-constraints",
-        default="must follow issue scope,must escalate ambiguity",
-        help="Comma-separated role constraints injected into supervisor payload",
-    )
-    parser.add_argument(
-        "--role-authority-boundaries",
-        default="follow-governance",
-        help="Comma-separated authority boundary markers",
-    )
-    parser.add_argument(
-        "--role-quality-standards",
-        default="deterministic decisions",
-        help="Comma-separated role quality standards",
     )
     parser.add_argument(
         "--summary-only",
@@ -341,9 +362,6 @@ def main() -> None:
             "flow_passed="
             + ("yes" if output["responded"]["status"] == "answered" else "no")
         )
-        escalate_to = output["supervisor_decision"].get("escalate_to_role_slug")
-        if escalate_to:
-            print(f"escalate_to_role_slug={escalate_to}")
         return
     print(json.dumps(output, indent=2))
 

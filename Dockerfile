@@ -12,7 +12,12 @@ RUN apt-get update \
         docker-cli \
         sqlite3 \
         curl \
+        nodejs \
+        npm \
     && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex \
+    && codex --version >/dev/null
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
