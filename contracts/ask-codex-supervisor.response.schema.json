@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-engineering/contracts/ask-codex-supervisor/response.schema.json",
+  "title": "ask_codex_supervisor response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "rationale",
+    "next_actions",
+    "confidence",
+    "safety_checks",
+    "audit_tags"
+  ],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": [
+        "proceed",
+        "retry",
+        "replan",
+        "pause_for_human",
+        "stop"
+      ]
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "next_actions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string"
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "safety_checks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "audit_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "ask_codex_supervisor",
+  "version": "0.1.0",
+  "description": "Escalate blocked/ambiguous local-agent decisions to Codex for supervised next-step guidance.",
+  "request_schema": "ask-codex-supervisor.request.schema.json",
+  "response_schema": "ask-codex-supervisor.response.schema.json",
+  "required_policies": [
+    "authorized_scope_required",
+    "evidence_required_on_repeated_failure",
+    "stop_on_pause_for_human_or_stop"
+  ]
+}

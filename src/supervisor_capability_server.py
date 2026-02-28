@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Context-agnostic supervisor capability MCP server.
+"""Codex supervisor capability MCP server.
 
-This service evaluates escalation payloads from role workers.
-It intentionally does not embed any role-specific mission context.
+This service exposes ask_codex_supervisor using governed request/response schemas.
+Runtime backend for this phase is Codex CLI only.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
-import uuid
-from datetime import datetime, timezone
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from jsonschema import ValidationError, validate
+from jsonschema import Draft202012Validator
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -24,11 +25,13 @@ DEFAULT_TRANSPORT = "streamable-http"
 ALLOWED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
 
 DEFAULT_REQUIRE_SHARED_TOKEN = True
-DEFAULT_ESCALATE_ROLE = "executive-sponsor"
+DEFAULT_CODEX_CLI_BIN = "codex"
+DEFAULT_CODEX_CLI_TIMEOUT_SECONDS = 90.0
+DEFAULT_CODEX_MODEL = "gpt-5"
 
-SCHEMA_DIR = Path(__file__).resolve().parents[1] / "contracts" / "supervisor" / "v1"
-REQUEST_SCHEMA_PATH = SCHEMA_DIR / "request.schema.json"
-RESPONSE_SCHEMA_PATH = SCHEMA_DIR / "response.schema.json"
+CONTRACT_DIR = Path(__file__).resolve().parents[1] / "contracts"
+REQUEST_SCHEMA_PATH = CONTRACT_DIR / "ask-codex-supervisor.request.schema.json"
+RESPONSE_SCHEMA_PATH = CONTRACT_DIR / "ask-codex-supervisor.response.schema.json"
 
 
 class ConfigError(RuntimeError):
@@ -53,14 +56,29 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or not raw.strip():
         return default
     try:
-        value = int(raw)
+        parsed = int(raw)
     except ValueError:
         print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
         return default
-    if value <= 0:
+    if parsed <= 0:
         print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
         return default
-    return value
+    return parsed
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
+        return default
+    if parsed <= 0:
+        print(f"Invalid {name}={raw!r}; using default {default}.", file=sys.stderr)
+        return default
+    return parsed
 
 
 def _resolve_transport(raw_transport: str) -> str:
@@ -78,123 +96,193 @@ def _resolve_transport(raw_transport: str) -> str:
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise ConfigError(f"Schema file missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _extract_json_object(raw_text: str) -> dict[str, Any]:
+    cleaned = raw_text.strip()
+
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        if lines and lines[0].strip().lower() == "json":
+            lines = lines[1:]
+        cleaned = "\n".join(lines).strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in Codex response text")
+
+    parsed = json.loads(cleaned[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Codex response JSON was not an object")
+    return parsed
 
 
-def _refusal_response(
-    request_payload: dict[str, Any] | None,
-    reason: str,
-    *,
-    escalate_to_role_slug: str | None = None,
-) -> dict[str, Any]:
-    payload = request_payload or {}
+def _dedupe_tags(tags: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for tag in tags:
+        if tag in seen:
+            continue
+        output.append(tag)
+        seen.add(tag)
+    return output
+
+
+def _fail_safe_response(reason: str, label: str) -> dict[str, Any]:
     return {
-        "request_id": str(payload.get("request_id") or "unknown"),
-        "task_id": str(payload.get("task_id") or "unknown"),
-        "decision_id": str(uuid.uuid4()),
-        "status": "refused",
-        "decision": "deny",
-        "rationale": "Supervisor capability refused request due to invalid or ambiguous context.",
-        "constraints_to_apply": [],
-        "questions_for_worker": [],
-        "escalate_to_role_slug": escalate_to_role_slug,
-        "refusal_reason": reason,
-        "created_at": _now_iso(),
-        "metadata": {},
+        "decision": "pause_for_human",
+        "rationale": (
+            "Codex supervisor fail-safe response: "
+            f"{reason} ({label}). Human review is required before continuing."
+        ),
+        "next_actions": [
+            "Capture current objective, blocked reason, and evidence summary.",
+            "Verify Codex CLI availability and login status in supervisor runtime.",
+            "Retry escalation after resolving the runtime/configuration issue.",
+        ],
+        "confidence": 0.1,
+        "safety_checks": [
+            "Authorized scope present",
+            "Escalation reason explicit",
+            "No out-of-scope action requested",
+        ],
+        "audit_tags": _dedupe_tags([
+            "fail-safe",
+            f"error:{label}",
+            "manual-review-required",
+        ]),
     }
 
 
-def _semantic_role_context_errors(payload: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    role_context = payload.get("role_context") if isinstance(payload, dict) else None
-    if not isinstance(role_context, dict):
-        return ["role_context missing or invalid"]
-
-    supervisor_role_slug = str(payload.get("supervisor_role_slug") or "").strip()
-    context_role_slug = str(role_context.get("role_slug") or "").strip()
-    if not supervisor_role_slug:
-        errors.append("supervisor_role_slug missing")
-    if not context_role_slug:
-        errors.append("role_context.role_slug missing")
-
-    if supervisor_role_slug and context_role_slug and supervisor_role_slug != context_role_slug:
-        errors.append("role_context.role_slug must match supervisor_role_slug")
-
-    role_ref = str(role_context.get("role_job_description_ref") or "").strip()
-    role_hash = str(role_context.get("role_job_description_sha256") or "").strip()
-    if not role_ref:
-        errors.append("role_context.role_job_description_ref missing")
-    if not role_hash:
-        errors.append("role_context.role_job_description_sha256 missing")
-
-    constraints = role_context.get("constraints")
-    if not isinstance(constraints, list) or not constraints:
-        errors.append("role_context.constraints must include at least one constraint")
-
-    return errors
+def _error_label(exc: Exception) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "codex-timeout"
+    if isinstance(exc, FileNotFoundError):
+        return "codex-cli-not-found"
+    if isinstance(exc, json.JSONDecodeError):
+        return "json-decode-error"
+    return exc.__class__.__name__.lower()
 
 
-def _decision_for_payload(payload: dict[str, Any], *, default_escalate_role: str) -> dict[str, Any]:
-    role_context = payload["role_context"]
-    task_context = payload["task_context"]
-    requested_decision = str(payload.get("requested_decision") or "auto").strip().lower()
-    escalation_reason = str(payload.get("escalation_reason") or "other").strip().lower()
-    question = str(payload.get("question") or "").strip().lower()
+def _assert_shared_token(shared_token: str) -> None:
+    if not JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN:
+        return
+    if not shared_token or shared_token != JOSHGPT_SUPERVISOR_SHARED_TOKEN:
+        raise PermissionError("invalid shared_token")
 
-    authority_boundaries = {
-        str(item).strip().lower() for item in role_context.get("authority_boundaries", [])
-    }
-    constraints_to_apply = [str(item) for item in role_context.get("constraints", [])]
 
-    response = {
-        "request_id": payload["request_id"],
-        "task_id": payload["task_id"],
-        "decision_id": str(uuid.uuid4()),
-        "status": "ok",
-        "decision": "allow",
-        "rationale": "Supervisor capability approved continuation within role constraints.",
-        "constraints_to_apply": constraints_to_apply,
-        "questions_for_worker": [],
-        "escalate_to_role_slug": None,
-        "refusal_reason": None,
-        "created_at": _now_iso(),
-        "metadata": {
-            "requested_decision": requested_decision,
-            "escalation_reason": escalation_reason,
-            "role_context_ref": role_context.get("role_job_description_ref"),
-            "task_objective": task_context.get("objective"),
-        },
-    }
+def _resolve_codex_bin() -> str:
+    resolved = shutil.which(JOSHGPT_SUPERVISOR_CODEX_CLI_BIN)
+    if resolved:
+        return resolved
 
-    if requested_decision in {"allow", "deny", "clarify", "escalate"}:
-        response["decision"] = requested_decision
-        response["rationale"] = "Supervisor capability honored explicit requested_decision override."
+    candidate = Path(JOSHGPT_SUPERVISOR_CODEX_CLI_BIN)
+    if candidate.is_absolute() and candidate.exists() and candidate.is_file():
+        return str(candidate)
 
-    if escalation_reason in {"instruction_ambiguity", "missing_required_input"}:
-        response["decision"] = "clarify"
-        response["rationale"] = "Worker must clarify ambiguity before continuing."
-        response["questions_for_worker"] = [
-            "Provide the missing instruction details and explicit acceptance criteria before execution continues."
-        ]
+    raise FileNotFoundError(
+        f"codex cli binary not found: {JOSHGPT_SUPERVISOR_CODEX_CLI_BIN}"
+    )
 
-    if escalation_reason == "authority_conflict":
-        response["decision"] = "escalate"
-        response["rationale"] = "Authority conflict requires escalation outside worker/supervisor pair."
-        response["escalate_to_role_slug"] = default_escalate_role
 
-    protected_change_detected = "protected" in question or "governance.md" in question
-    if protected_change_detected and "protected-change-approval" not in authority_boundaries:
-        response["decision"] = "escalate"
-        response["rationale"] = (
-            "Detected protected-change intent without explicit supervisor boundary approval marker."
+def _ensure_codex_login_status(codex_bin: str) -> None:
+    completed = subprocess.run(
+        [codex_bin, "login", "status"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"codex login status failed: {detail[:300]}")
+
+
+def _build_codex_exec_prompt(payload: dict[str, Any]) -> str:
+    return (
+        "You are a supervisor agent. Return only one JSON object that strictly matches "
+        "the provided response schema. No markdown and no extra prose. "
+        "If uncertain, choose decision=pause_for_human.\n\n"
+        "Escalation payload JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=True, separators=(',', ':'))}"
+    )
+
+
+def _call_codex_cli(payload: dict[str, Any]) -> dict[str, Any]:
+    codex_bin = _resolve_codex_bin()
+    _ensure_codex_login_status(codex_bin)
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="codex-supervisor-",
+        suffix=".json",
+        delete=False,
+    )
+    output_path = Path(tmp.name)
+    tmp.close()
+
+    cmd = [
+        codex_bin,
+        "-a",
+        "never",
+        "-m",
+        JOSHGPT_SUPERVISOR_CODEX_MODEL,
+        "exec",
+        "-",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--output-schema",
+        str(RESPONSE_SCHEMA_PATH),
+        "--output-last-message",
+        str(output_path),
+        "--color",
+        "never",
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            input=_build_codex_exec_prompt(payload),
+            capture_output=True,
+            text=True,
+            timeout=JOSHGPT_SUPERVISOR_CODEX_CLI_TIMEOUT_SECONDS,
+            check=False,
         )
-        response["escalate_to_role_slug"] = default_escalate_role
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"codex exec failed: {detail[:500]}")
 
-    return response
+        raw_output = output_path.read_text(encoding="utf-8").strip()
+        if not raw_output:
+            raise ValueError("codex exec produced empty output")
+
+        try:
+            parsed = json.loads(raw_output)
+        except json.JSONDecodeError:
+            parsed = _extract_json_object(raw_output)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("codex exec output was not a JSON object")
+
+        existing_tags = parsed.get("audit_tags")
+        normalized_tags = (
+            [tag for tag in existing_tags if isinstance(tag, str) and tag.strip()]
+            if isinstance(existing_tags, list)
+            else []
+        )
+        parsed["audit_tags"] = _dedupe_tags(
+            normalized_tags + ["provider-codex-cli", "proxy-enabled"]
+        )
+        return parsed
+    finally:
+        output_path.unlink(missing_ok=True)
 
 
 JOSHGPT_SUPERVISOR_BIND_HOST = (
@@ -208,9 +296,17 @@ JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN = _env_bool(
     "JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN", DEFAULT_REQUIRE_SHARED_TOKEN
 )
 JOSHGPT_SUPERVISOR_SHARED_TOKEN = os.getenv("JOSHGPT_SUPERVISOR_SHARED_TOKEN", "")
-JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE = (
-    os.getenv("JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE", DEFAULT_ESCALATE_ROLE).strip()
-    or DEFAULT_ESCALATE_ROLE
+JOSHGPT_SUPERVISOR_CODEX_CLI_BIN = (
+    os.getenv("JOSHGPT_SUPERVISOR_CODEX_CLI_BIN", DEFAULT_CODEX_CLI_BIN).strip()
+    or DEFAULT_CODEX_CLI_BIN
+)
+JOSHGPT_SUPERVISOR_CODEX_CLI_TIMEOUT_SECONDS = _env_float(
+    "JOSHGPT_SUPERVISOR_CODEX_CLI_TIMEOUT_SECONDS",
+    DEFAULT_CODEX_CLI_TIMEOUT_SECONDS,
+)
+JOSHGPT_SUPERVISOR_CODEX_MODEL = (
+    os.getenv("JOSHGPT_SUPERVISOR_CODEX_MODEL", DEFAULT_CODEX_MODEL).strip()
+    or DEFAULT_CODEX_MODEL
 )
 
 if JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN and not JOSHGPT_SUPERVISOR_SHARED_TOKEN:
@@ -219,8 +315,8 @@ if JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN and not JOSHGPT_SUPERVISOR_SHARED_TOK
         "JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN=true"
     )
 
-REQUEST_SCHEMA = _load_json(REQUEST_SCHEMA_PATH)
-RESPONSE_SCHEMA = _load_json(RESPONSE_SCHEMA_PATH)
+REQUEST_VALIDATOR = Draft202012Validator(_load_json(REQUEST_SCHEMA_PATH))
+RESPONSE_VALIDATOR = Draft202012Validator(_load_json(RESPONSE_SCHEMA_PATH))
 
 mcp = FastMCP(
     "joshgpt-supervisor-capability",
@@ -229,43 +325,33 @@ mcp = FastMCP(
 )
 
 
-def _assert_shared_token(shared_token: str) -> None:
-    if not JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN:
-        return
-    if not shared_token or shared_token != JOSHGPT_SUPERVISOR_SHARED_TOKEN:
-        raise PermissionError("invalid shared_token")
-
-
 @mcp.tool()
-def ask_supervisor_capability(payload: dict[str, Any], shared_token: str = "") -> dict[str, Any]:
-    """Return deterministic supervisor decision for role-injected context payload."""
+def ask_codex_supervisor(payload: dict[str, Any], shared_token: str = "") -> dict[str, Any]:
+    """Escalate worker context to Codex supervisor (CLI backend)."""
 
     _assert_shared_token(shared_token)
 
     try:
-        validate(instance=payload, schema=REQUEST_SCHEMA)
-    except ValidationError as exc:
-        return _refusal_response(payload, f"schema validation failed: {exc.message}")
-
-    semantic_errors = _semantic_role_context_errors(payload)
-    if semantic_errors:
-        return _refusal_response(payload, "; ".join(semantic_errors))
-
-    response = _decision_for_payload(
-        payload,
-        default_escalate_role=JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE,
-    )
+        REQUEST_VALIDATOR.validate(payload)
+    except Exception as exc:
+        response = _fail_safe_response(
+            "request validation failed",
+            _error_label(exc),
+        )
+        RESPONSE_VALIDATOR.validate(response)
+        return response
 
     try:
-        validate(instance=response, schema=RESPONSE_SCHEMA)
-    except ValidationError as exc:
-        return _refusal_response(
-            payload,
-            f"internal response validation failed: {exc.message}",
-            escalate_to_role_slug=JOSHGPT_SUPERVISOR_DEFAULT_ESCALATE_ROLE,
+        response = _call_codex_cli(payload)
+        RESPONSE_VALIDATOR.validate(response)
+        return response
+    except Exception as exc:
+        fail_safe = _fail_safe_response(
+            "codex supervisor runtime failed",
+            _error_label(exc),
         )
-
-    return response
+        RESPONSE_VALIDATOR.validate(fail_safe)
+        return fail_safe
 
 
 if __name__ == "__main__":
@@ -275,7 +361,9 @@ if __name__ == "__main__":
             f"transport={JOSHGPT_SUPERVISOR_TRANSPORT} "
             f"host={JOSHGPT_SUPERVISOR_BIND_HOST} "
             f"port={JOSHGPT_SUPERVISOR_BIND_PORT} "
-            f"require_shared_token={JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN}"
+            f"require_shared_token={JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN} "
+            f"codex_cli_bin={JOSHGPT_SUPERVISOR_CODEX_CLI_BIN} "
+            f"codex_model={JOSHGPT_SUPERVISOR_CODEX_MODEL}"
         ),
         flush=True,
     )
