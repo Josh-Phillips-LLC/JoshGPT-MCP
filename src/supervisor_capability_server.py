@@ -13,11 +13,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+from logging_helpers import emit_log_event, resolve_correlation
 
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_BIND_PORT = 8789
@@ -169,6 +172,71 @@ def _error_label(exc: Exception) -> str:
     if isinstance(exc, json.JSONDecodeError):
         return "json-decode-error"
     return exc.__class__.__name__.lower()
+
+
+def _duration_ms(started_at: float) -> int:
+    return max(0, int((time.time() - started_at) * 1000))
+
+
+def _extract_headers(ctx: Context | None) -> dict[str, str]:
+    if ctx is None:
+        return {}
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return {}
+    if request is None:
+        return {}
+    raw_headers = getattr(request, "headers", None)
+    if not raw_headers or not hasattr(raw_headers, "items"):
+        return {}
+    headers: dict[str, str] = {}
+    for key, value in raw_headers.items():
+        headers[str(key).lower()] = str(value)
+    return headers
+
+
+def _resolve_call_correlation(
+    payload: dict[str, Any],
+    *,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> tuple[dict[str, str], str]:
+    return resolve_correlation(
+        payload,
+        correlation=correlation or {},
+        headers=_extract_headers(ctx),
+    )
+
+
+def _emit_supervisor_event(
+    *,
+    event: str,
+    message: str,
+    correlation: dict[str, str],
+    correlation_source: str,
+    level: str = "info",
+    operation: str = "",
+    status: str = "",
+    duration_ms: int | None = None,
+    error_code: str = "",
+    attrs: dict[str, Any] | None = None,
+) -> None:
+    emit_log_event(
+        service="supervisor",
+        event=event,
+        message=message,
+        level=level,
+        correlation=correlation,
+        correlation_source=correlation_source,
+        component="supervisor-capability",
+        operation=operation,
+        status=status,
+        duration_ms=duration_ms,
+        error_code=error_code,
+        model=JOSHGPT_SUPERVISOR_CODEX_MODEL,
+        attrs=attrs or {},
+    )
 
 
 def _assert_shared_token(shared_token: str) -> None:
@@ -326,10 +394,36 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def ask_codex_supervisor(payload: dict[str, Any], shared_token: str = "") -> dict[str, Any]:
+def ask_codex_supervisor(
+    payload: dict[str, Any],
+    shared_token: str = "",
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Escalate worker context to Codex supervisor (CLI backend)."""
 
-    _assert_shared_token(shared_token)
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        payload,
+        correlation=correlation,
+        ctx=ctx,
+    )
+    try:
+        _assert_shared_token(shared_token)
+    except Exception as exc:
+        _emit_supervisor_event(
+            event="supervisor.decision",
+            message="Supervisor request rejected by shared token policy.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="ask_codex_supervisor",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_label(exc),
+            attrs={"error": str(exc)},
+        )
+        raise
 
     try:
         REQUEST_VALIDATOR.validate(payload)
@@ -339,11 +433,50 @@ def ask_codex_supervisor(payload: dict[str, Any], shared_token: str = "") -> dic
             _error_label(exc),
         )
         RESPONSE_VALIDATOR.validate(response)
+        _emit_supervisor_event(
+            event="supervisor.decision",
+            message="Supervisor request validation failed; returned fail-safe response.",
+            level="warning",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="ask_codex_supervisor",
+            status="fail_safe",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_label(exc),
+            attrs={
+                "decision": response.get("decision"),
+                "audit_tags": response.get("audit_tags", []),
+            },
+        )
         return response
+
+    _emit_supervisor_event(
+        event="supervisor.decision",
+        message="Supervisor request accepted for Codex evaluation.",
+        correlation=resolved_correlation,
+        correlation_source=correlation_source,
+        operation="ask_codex_supervisor",
+        status="start",
+        attrs={"requested_decision": str(payload.get("requested_decision", ""))},
+    )
 
     try:
         response = _call_codex_cli(payload)
         RESPONSE_VALIDATOR.validate(response)
+        _emit_supervisor_event(
+            event="supervisor.decision",
+            message="Supervisor decision generated by Codex.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="ask_codex_supervisor",
+            status="ok",
+            duration_ms=_duration_ms(started_at),
+            attrs={
+                "decision": response.get("decision"),
+                "confidence": response.get("confidence"),
+                "audit_tags": response.get("audit_tags", []),
+            },
+        )
         return response
     except Exception as exc:
         fail_safe = _fail_safe_response(
@@ -351,10 +484,41 @@ def ask_codex_supervisor(payload: dict[str, Any], shared_token: str = "") -> dic
             _error_label(exc),
         )
         RESPONSE_VALIDATOR.validate(fail_safe)
+        _emit_supervisor_event(
+            event="supervisor.decision",
+            message="Supervisor runtime failed; returned fail-safe response.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="ask_codex_supervisor",
+            status="fail_safe",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_label(exc),
+            attrs={
+                "error": str(exc),
+                "decision": fail_safe.get("decision"),
+                "audit_tags": fail_safe.get("audit_tags", []),
+            },
+        )
         return fail_safe
 
 
 if __name__ == "__main__":
+    _emit_supervisor_event(
+        event="supervisor.startup",
+        message="Supervisor capability service starting.",
+        correlation={"chat_session_id": "unknown", "turn_id": "unknown", "request_id": "", "tool_call_id": ""},
+        correlation_source="unknown",
+        operation="startup",
+        status="ok",
+        attrs={
+            "transport": JOSHGPT_SUPERVISOR_TRANSPORT,
+            "bind_host": JOSHGPT_SUPERVISOR_BIND_HOST,
+            "bind_port": JOSHGPT_SUPERVISOR_BIND_PORT,
+            "codex_cli_bin": JOSHGPT_SUPERVISOR_CODEX_CLI_BIN,
+            "codex_model": JOSHGPT_SUPERVISOR_CODEX_MODEL,
+        },
+    )
     print(
         (
             "Starting joshgpt-supervisor-capability with "

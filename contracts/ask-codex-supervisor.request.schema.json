@@ -12,7 +12,8 @@
     "attempt_history",
     "constraints",
     "authorized_scope",
-    "requested_decision"
+    "requested_decision",
+    "supervisor_context"
   ],
   "properties": {
     "mission_id": {
@@ -93,6 +94,120 @@
         "deconflict",
         "stop_or_continue"
       ]
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "chat_session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "turn_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_call_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "supervisor_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instruction_context"
+      ],
+      "properties": {
+        "instruction_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "role_slug",
+            "role_display_name",
+            "registry_source",
+            "registry_version",
+            "context_ref",
+            "context_sha256",
+            "agents_excerpt",
+            "runtime_policy_excerpt",
+            "runtime_policy_ref",
+            "runtime_policy_sha256"
+          ],
+          "properties": {
+            "role_slug": {
+              "type": "string",
+              "minLength": 1
+            },
+            "role_display_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "registry_source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "registry_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "context_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "context_sha256": {
+              "type": "string",
+              "minLength": 1
+            },
+            "agents_excerpt": {
+              "type": "string"
+            },
+            "runtime_policy_excerpt": {
+              "type": "string"
+            },
+            "runtime_policy_ref": {
+              "type": "string",
+              "minLength": 1
+            },
+            "runtime_policy_sha256": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "session_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "conversation_summary": {
+              "type": "string"
+            },
+            "escalation_history": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recent_tool_events": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "guardrail_state": {
+              "type": "object"
+            }
+          }
+        }
+      }
     }
   }
 }

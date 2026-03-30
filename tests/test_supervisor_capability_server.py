@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -21,6 +22,19 @@ os.environ.setdefault("JOSHGPT_SUPERVISOR_REQUIRE_SHARED_TOKEN", "false")
 
 import supervisor_capability_server as server  # noqa: E402
 
+INSTRUCTION_CONTEXT = {
+    "role_slug": "hr-ai-agent-specialist",
+    "role_display_name": "HR and AI Agent Specialist",
+    "registry_source": "00-os/role-registry.yml",
+    "registry_version": "1.0",
+    "context_ref": "00-os/role-registry.yml|1.0|hr-ai-agent-specialist|role/AGENTS.md@abc|role/.github/copilot-instructions.md@def",
+    "context_sha256": "0123456789abcdef",
+    "agents_excerpt": "Supervisor role instructions excerpt",
+    "runtime_policy_excerpt": "Runtime policy excerpt",
+    "runtime_policy_ref": "context-engineering-role-hr-ai-agent-specialist/.github/copilot-instructions.md",
+    "runtime_policy_sha256": "fedcba9876543210",
+}
+
 VALID_REQUEST_PAYLOAD = {
     "mission_id": "mission-123",
     "goal": "Resolve worker blocker with supervisor decision",
@@ -35,6 +49,9 @@ VALID_REQUEST_PAYLOAD = {
         "expires_utc": "2026-02-27T23:59:59Z",
     },
     "requested_decision": "next_step",
+    "supervisor_context": {
+        "instruction_context": INSTRUCTION_CONTEXT,
+    },
 }
 
 VALID_RESPONSE_PAYLOAD = {
@@ -92,6 +109,43 @@ class SupervisorCapabilityServerTests(unittest.TestCase):
 
         server.RESPONSE_VALIDATOR.validate(response)
         self.assertEqual(response["decision"], "pause_for_human")
+
+    def test_request_requires_instruction_context(self) -> None:
+        missing_context_payload = copy.deepcopy(VALID_REQUEST_PAYLOAD)
+        missing_context_payload["supervisor_context"] = {}
+
+        with mock.patch.object(server, "_call_codex_cli", return_value=VALID_RESPONSE_PAYLOAD):
+            response = server.ask_codex_supervisor(missing_context_payload, shared_token="")
+
+        self.assertEqual(response["decision"], "pause_for_human")
+
+    def test_schema_accepts_request_without_session_context(self) -> None:
+        payload = copy.deepcopy(VALID_REQUEST_PAYLOAD)
+        server.REQUEST_VALIDATOR.validate(payload)
+
+    def test_schema_accepts_request_with_session_context(self) -> None:
+        payload = copy.deepcopy(VALID_REQUEST_PAYLOAD)
+        payload["supervisor_context"]["session_context"] = {
+            "session_id": "session-123",
+            "conversation_summary": "Summarized conversation state.",
+            "escalation_history": ["Escalated once for validation blocker."],
+            "recent_tool_events": ["run_local_shell_command: ok"],
+            "guardrail_state": {
+                "mode": "strict",
+            },
+        }
+
+        server.REQUEST_VALIDATOR.validate(payload)
+
+    def test_schema_accepts_request_with_correlation(self) -> None:
+        payload = copy.deepcopy(VALID_REQUEST_PAYLOAD)
+        payload["correlation"] = {
+            "chat_session_id": "session-123",
+            "turn_id": "turn-01",
+            "request_id": "req-01",
+            "tool_call_id": "tool-01",
+        }
+        server.REQUEST_VALIDATOR.validate(payload)
 
 
 if __name__ == "__main__":

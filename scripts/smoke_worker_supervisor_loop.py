@@ -100,6 +100,28 @@ class McpToolClient:
 async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     dispatcher_token = args.dispatcher_shared_token
     supervisor_token = args.supervisor_shared_token
+    chat_session_id = (
+        args.chat_session_id.strip()
+        if args.chat_session_id and args.chat_session_id.strip()
+        else f"smoke-session-{uuid.uuid4().hex[:12]}"
+    )
+    turn_id = (
+        args.turn_id.strip()
+        if args.turn_id and args.turn_id.strip()
+        else f"smoke-turn-{uuid.uuid4().hex[:10]}"
+    )
+    tool_call_id = f"smoke-tool-{uuid.uuid4().hex[:8]}"
+    request_counter = 0
+
+    def next_correlation(step: str) -> dict[str, str]:
+        nonlocal request_counter
+        request_counter += 1
+        return {
+            "chat_session_id": chat_session_id,
+            "turn_id": turn_id,
+            "request_id": f"smoke-req-{request_counter:02d}-{step}",
+            "tool_call_id": tool_call_id,
+        }
 
     task_constraints = _parse_csv(args.task_constraints)
     task_input_refs = _parse_csv(args.task_input_refs)
@@ -123,6 +145,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "objective": args.objective,
                     "constraints": task_constraints,
                     "input_refs": task_input_refs,
+                    "correlation": next_correlation("dispatch"),
                 },
                 "shared_token": dispatcher_token,
             },
@@ -135,6 +158,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "role_slug": args.worker_role_slug,
                 "shared_token": dispatcher_token,
+                "correlation": next_correlation("claim"),
             },
         )
 
@@ -149,6 +173,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "role_context_ref": role_context_ref,
                 "role_context_sha256": role_context_sha256,
                 "shared_token": dispatcher_token,
+                "correlation": next_correlation("question-submit"),
             },
         )
 
@@ -157,6 +182,16 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "role_slug": args.supervisor_role_slug,
                 "shared_token": dispatcher_token,
+                "correlation": next_correlation("question-list"),
+            },
+        )
+
+        role_context = await dispatcher.call(
+            "get_supervisor_role_context",
+            {
+                "role_slug": args.supervisor_role_slug,
+                "shared_token": dispatcher_token,
+                "correlation": next_correlation("context-load"),
             },
         )
 
@@ -173,6 +208,8 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "expires_utc": args.authorized_expires_utc,
         },
         "requested_decision": args.requested_decision,
+        "correlation": next_correlation("supervisor-request"),
+        "supervisor_context": role_context,
     }
     if args.evidence_summary.strip():
         request_payload["evidence_summary"] = args.evidence_summary.strip()
@@ -183,6 +220,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "payload": request_payload,
                 "shared_token": supervisor_token,
+                "correlation": next_correlation("supervisor-call"),
             },
         )
 
@@ -194,21 +232,28 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "supervisor_role_slug": args.supervisor_role_slug,
                 "decision_payload": decision,
                 "shared_token": dispatcher_token,
+                "correlation": next_correlation("question-respond"),
             },
         )
 
         task_status = await dispatcher.call(
             "get_task_status",
-            {"task_id": task_id},
+            {
+                "task_id": task_id,
+                "correlation": next_correlation("task-status"),
+            },
         )
 
     return {
         "dispatcher_url": args.dispatcher_url,
         "supervisor_url": args.supervisor_url,
+        "chat_session_id": chat_session_id,
+        "turn_id": turn_id,
         "dispatched": dispatched,
         "claimed": claimed,
         "question": question,
         "pending_for_supervisor": pending,
+        "supervisor_role_context": role_context,
         "supervisor_request": request_payload,
         "supervisor_decision": decision,
         "responded": responded,
@@ -239,6 +284,16 @@ def parse_args() -> argparse.Namespace:
         "--supervisor-shared-token",
         default="replace-me-supervisor-token",
         help="Shared token for supervisor capability tool",
+    )
+    parser.add_argument(
+        "--chat-session-id",
+        default="",
+        help="Optional fixed chat_session_id for correlation (auto-generated if empty)",
+    )
+    parser.add_argument(
+        "--turn-id",
+        default="",
+        help="Optional fixed turn_id for correlation (auto-generated if empty)",
     )
     parser.add_argument(
         "--worker-role-slug",

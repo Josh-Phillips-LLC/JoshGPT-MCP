@@ -25,6 +25,8 @@ services:
     command: ["python", "src/dispatcher_mcp_server.py"]
     volumes:
       - "${JOSHGPT_DISPATCHER_DB_VOLUME:-joshgpt-dispatcher-data}:/data"
+      - "${JOSHGPT_ROLE_REGISTRY_MOUNT_PATH:-../context-engineering-implementation/00-os/role-registry.yml}:/registry/role-registry.yml:ro"
+      - "${JOSHGPT_ROLE_REPOS_BASE_MOUNT_PATH:-..}:/role-repos:ro"
     environment:
       - JOSHGPT_DISPATCHER_BIND_HOST=${JOSHGPT_DISPATCHER_BIND_HOST:-0.0.0.0}
       - JOSHGPT_DISPATCHER_BIND_PORT=${JOSHGPT_DISPATCHER_BIND_PORT:-8788}
@@ -32,6 +34,9 @@ services:
       - JOSHGPT_DISPATCHER_DB_PATH=${JOSHGPT_DISPATCHER_DB_PATH:-/data/dispatcher.db}
       - JOSHGPT_DISPATCHER_REQUIRE_SHARED_TOKEN=${JOSHGPT_DISPATCHER_REQUIRE_SHARED_TOKEN:-true}
       - JOSHGPT_DISPATCHER_SHARED_TOKEN=${JOSHGPT_DISPATCHER_SHARED_TOKEN:-replace-me-dispatcher-token}
+      - JOSHGPT_ROLE_REGISTRY_PATH=${JOSHGPT_ROLE_REGISTRY_PATH:-/registry/role-registry.yml}
+      - JOSHGPT_ROLE_REPOS_BASE_PATH=${JOSHGPT_ROLE_REPOS_BASE_PATH:-/role-repos}
+      - JOSHGPT_SUPERVISOR_CONTEXT_MAX_CHARS=${JOSHGPT_SUPERVISOR_CONTEXT_MAX_CHARS:-12000}
     ports:
       - "${JOSHGPT_DISPATCHER_PUBLISH_HOST:-127.0.0.1}:${JOSHGPT_DISPATCHER_PUBLISH_PORT:-8788}:${JOSHGPT_DISPATCHER_BIND_PORT:-8788}"
 

@@ -34,6 +34,21 @@ Canonical supervisor schemas:
 Fail-safe rule:
 - If payload validation or Codex runtime execution fails, supervisor returns a deterministic schema-valid `pause_for_human` response.
 
+## Structured Logging
+
+All three services emit one JSON log event per operation to stdout for Loki/Vector ingestion.
+
+- `service=toolhost` from `src/joshgpt_mcp_server.py`
+- `service=dispatcher` from `src/dispatcher_mcp_server.py`
+- `service=supervisor` from `src/supervisor_capability_server.py`
+
+Correlation resolution order:
+
+1. explicit `correlation` argument
+2. `payload.correlation` object
+3. inbound headers (`x-chat-session-id`, `x-turn-id`, `x-request-id`, `x-tool-call-id`) when available
+4. fallback `unknown`
+
 ## Services and Tools
 
 ### 1) Tool-host (`toolhost`)
@@ -56,6 +71,8 @@ Execution (policy-gated):
 - `submit_supervisor_question`
 - `list_pending_supervisor_questions`
 - `respond_supervisor_question`
+- `list_role_catalog`
+- `get_supervisor_role_context`
 - `get_task_status`
 - `list_role_queues`
 - `dispatcher_info`
@@ -63,6 +80,10 @@ Execution (policy-gated):
 ### 3) Supervisor capability (`supervisor`)
 
 - `ask_codex_supervisor`
+
+Public compatibility note:
+- `ask_codex_supervisor` request schema now accepts optional `correlation` object (non-breaking).
+- Dispatcher tools accept optional `correlation` argument (non-breaking).
 
 ## Quick Start
 
@@ -119,6 +140,11 @@ python src/supervisor_capability_server.py
 - `JOSHGPT_DISPATCHER_DB_PATH`
 - `JOSHGPT_DISPATCHER_REQUIRE_SHARED_TOKEN`
 - `JOSHGPT_DISPATCHER_SHARED_TOKEN`
+- `JOSHGPT_ROLE_REGISTRY_MOUNT_PATH` (compose host path for canonical registry file)
+- `JOSHGPT_ROLE_REPOS_BASE_MOUNT_PATH` (compose host path for role repos root)
+- `JOSHGPT_ROLE_REGISTRY_PATH`
+- `JOSHGPT_ROLE_REPOS_BASE_PATH`
+- `JOSHGPT_SUPERVISOR_CONTEXT_MAX_CHARS`
 
 ### Supervisor capability
 - `JOSHGPT_SUPERVISOR_BIND_HOST`
@@ -160,6 +186,8 @@ Optional example with explicit tokens/endpoints:
   --supervisor-url http://127.0.0.1:8789/mcp \
   --dispatcher-shared-token replace-me-dispatcher-token \
   --supervisor-shared-token replace-me-supervisor-token \
+  --chat-session-id smoke-session-001 \
+  --turn-id smoke-turn-001 \
   --worker-role-slug implementation-specialist \
   --supervisor-role-slug hr-ai-agent-specialist \
   --requested-decision next_step
@@ -169,6 +197,7 @@ Script sequence:
 - dispatch task
 - claim task
 - submit supervisor question
+- fetch selected supervisor `instruction_context` via dispatcher
 - call `ask_codex_supervisor`
 - record supervisor response
 - fetch final task status/events

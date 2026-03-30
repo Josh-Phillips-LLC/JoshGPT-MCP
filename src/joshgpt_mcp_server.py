@@ -24,7 +24,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+from logging_helpers import emit_log_event, resolve_correlation
 
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_BIND_PORT = 8787
@@ -194,6 +196,74 @@ mcp = FastMCP(
     host=JOSHGPT_MCP_BIND_HOST,
     port=JOSHGPT_MCP_BIND_PORT,
 )
+
+
+def _duration_ms(started_at: float) -> int:
+    return max(0, int((time.time() - started_at) * 1000))
+
+
+def _error_code(exc: Exception) -> str:
+    return exc.__class__.__name__.strip().lower() or "error"
+
+
+def _extract_headers(ctx: Context | None) -> dict[str, str]:
+    if ctx is None:
+        return {}
+    try:
+        request = ctx.request_context.request
+    except Exception:
+        return {}
+    if request is None:
+        return {}
+    raw_headers = getattr(request, "headers", None)
+    if not raw_headers or not hasattr(raw_headers, "items"):
+        return {}
+    headers: dict[str, str] = {}
+    for key, value in raw_headers.items():
+        headers[str(key).lower()] = str(value)
+    return headers
+
+
+def _resolve_call_correlation(
+    payload: dict[str, Any] | None = None,
+    *,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> tuple[dict[str, str], str]:
+    return resolve_correlation(
+        payload or {},
+        correlation=correlation or {},
+        headers=_extract_headers(ctx),
+    )
+
+
+def _emit_toolhost_event(
+    *,
+    event: str,
+    message: str,
+    correlation: dict[str, str],
+    correlation_source: str,
+    level: str = "info",
+    operation: str = "",
+    status: str = "",
+    duration_ms: int | None = None,
+    error_code: str = "",
+    attrs: dict[str, Any] | None = None,
+) -> None:
+    emit_log_event(
+        service="toolhost",
+        event=event,
+        message=message,
+        level=level,
+        correlation=correlation,
+        correlation_source=correlation_source,
+        component="joshgpt-mcp",
+        operation=operation,
+        status=status,
+        duration_ms=duration_ms,
+        error_code=error_code,
+        attrs=attrs or {},
+    )
 
 
 def _anchor_root_for_relative_paths() -> Path:
@@ -486,92 +556,188 @@ def _ensure_container_running(docker_bin: str, container_name: str) -> None:
 
 
 @mcp.tool()
-def list_files(path: str = ".", recursive: bool = False, max_entries: int | None = None) -> dict[str, Any]:
+def list_files(
+    path: str = ".",
+    recursive: bool = False,
+    max_entries: int | None = None,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """List files/directories under an allowed root path."""
 
-    target_dir = _resolve_path(path, expect="dir")
-    limit = _bounded_limit(max_entries, JOSHGPT_MCP_MAX_LIST_ENTRIES)
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {"path": path},
+        correlation=correlation,
+        ctx=ctx,
+    )
+    try:
+        target_dir = _resolve_path(path, expect="dir")
+        limit = _bounded_limit(max_entries, JOSHGPT_MCP_MAX_LIST_ENTRIES)
 
-    entries: list[dict[str, Any]] = []
-    iterator = target_dir.rglob("*") if recursive else target_dir.iterdir()
+        entries: list[dict[str, Any]] = []
+        iterator = target_dir.rglob("*") if recursive else target_dir.iterdir()
 
-    for item in iterator:
-        candidate = item.resolve(strict=False)
+        for item in iterator:
+            candidate = item.resolve(strict=False)
 
-        if not _is_under_allowed_root(candidate):
-            continue
-        if _contains_denied_segment(candidate):
-            continue
+            if not _is_under_allowed_root(candidate):
+                continue
+            if _contains_denied_segment(candidate):
+                continue
 
-        root = _matching_root(candidate)
-        relative_path = str(candidate.relative_to(root)) if root else str(candidate)
+            root = _matching_root(candidate)
+            relative_path = str(candidate.relative_to(root)) if root else str(candidate)
 
-        entries.append(
-            {
-                "path": str(candidate),
-                "relative_path": relative_path,
-                "type": "directory" if item.is_dir() else "file",
-                "size_bytes": _safe_size(item),
-            }
+            entries.append(
+                {
+                    "path": str(candidate),
+                    "relative_path": relative_path,
+                    "type": "directory" if item.is_dir() else "file",
+                    "size_bytes": _safe_size(item),
+                }
+            )
+
+            if len(entries) >= limit:
+                break
+
+        response = {
+            "path": str(target_dir),
+            "recursive": recursive,
+            "max_entries": limit,
+            "returned": len(entries),
+            "entries": entries,
+        }
+        _emit_toolhost_event(
+            event="toolhost.list_files",
+            message="Listed files under allowed root.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="list_files",
+            status="ok",
+            duration_ms=_duration_ms(started_at),
+            attrs={
+                "path": str(target_dir),
+                "recursive": recursive,
+                "returned": len(entries),
+            },
         )
-
-        if len(entries) >= limit:
-            break
-
-    return {
-        "path": str(target_dir),
-        "recursive": recursive,
-        "max_entries": limit,
-        "returned": len(entries),
-        "entries": entries,
-    }
+        return response
+    except Exception as exc:
+        _emit_toolhost_event(
+            event="toolhost.list_files",
+            message="Failed to list files.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="list_files",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_code(exc),
+            attrs={"path": str(path), "error": str(exc)},
+        )
+        raise
 
 
 @mcp.tool()
-def read_file(path: str, start_line: int = 1, end_line: int = 0) -> dict[str, Any]:
+def read_file(
+    path: str,
+    start_line: int = 1,
+    end_line: int = 0,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Read UTF-8 text from an allowed file path with optional line range."""
 
-    target_file = _resolve_path(path, expect="file")
-    size_bytes = target_file.stat().st_size
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {"path": path},
+        correlation=correlation,
+        ctx=ctx,
+    )
+    try:
+        target_file = _resolve_path(path, expect="file")
+        size_bytes = target_file.stat().st_size
 
-    if size_bytes > JOSHGPT_MCP_MAX_FILE_BYTES:
-        raise ValueError(
-            f"File too large ({size_bytes} bytes). "
-            f"Current limit: {JOSHGPT_MCP_MAX_FILE_BYTES} bytes."
-        )
+        if size_bytes > JOSHGPT_MCP_MAX_FILE_BYTES:
+            raise ValueError(
+                f"File too large ({size_bytes} bytes). "
+                f"Current limit: {JOSHGPT_MCP_MAX_FILE_BYTES} bytes."
+            )
 
-    text = target_file.read_text(encoding="utf-8", errors="replace")
-    lines = text.splitlines()
-    total_lines = len(lines)
+        text = target_file.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        total_lines = len(lines)
 
-    if total_lines == 0:
-        return {
+        if total_lines == 0:
+            response = {
+                "path": str(target_file),
+                "size_bytes": size_bytes,
+                "total_lines": 0,
+                "start_line": 1,
+                "end_line": 0,
+                "content": "",
+            }
+            _emit_toolhost_event(
+                event="toolhost.read_file",
+                message="Read empty file.",
+                correlation=resolved_correlation,
+                correlation_source=correlation_source,
+                operation="read_file",
+                status="ok",
+                duration_ms=_duration_ms(started_at),
+                attrs={"path": str(target_file), "size_bytes": size_bytes, "lines": 0},
+            )
+            return response
+
+        start = max(start_line, 1)
+        if start > total_lines:
+            start = total_lines
+
+        end = total_lines if end_line <= 0 else min(end_line, total_lines)
+        if end < start:
+            end = start
+
+        excerpt = "\n".join(lines[start - 1 : end])
+
+        response = {
             "path": str(target_file),
             "size_bytes": size_bytes,
-            "total_lines": 0,
-            "start_line": 1,
-            "end_line": 0,
-            "content": "",
+            "total_lines": total_lines,
+            "start_line": start,
+            "end_line": end,
+            "content": excerpt,
         }
-
-    start = max(start_line, 1)
-    if start > total_lines:
-        start = total_lines
-
-    end = total_lines if end_line <= 0 else min(end_line, total_lines)
-    if end < start:
-        end = start
-
-    excerpt = "\n".join(lines[start - 1 : end])
-
-    return {
-        "path": str(target_file),
-        "size_bytes": size_bytes,
-        "total_lines": total_lines,
-        "start_line": start,
-        "end_line": end,
-        "content": excerpt,
-    }
+        _emit_toolhost_event(
+            event="toolhost.read_file",
+            message="Read file excerpt.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="read_file",
+            status="ok",
+            duration_ms=_duration_ms(started_at),
+            attrs={
+                "path": str(target_file),
+                "size_bytes": size_bytes,
+                "start_line": start,
+                "end_line": end,
+            },
+        )
+        return response
+    except Exception as exc:
+        _emit_toolhost_event(
+            event="toolhost.read_file",
+            message="Failed to read file.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="read_file",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_code(exc),
+            attrs={"path": str(path), "error": str(exc)},
+        )
+        raise
 
 
 def _parse_search_output_line(line: str) -> tuple[str, int, str] | None:
@@ -589,81 +755,120 @@ def search_text(
     glob: str = "",
     max_matches: int | None = None,
     case_sensitive: bool = False,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Search text under an allowed path using ripgrep with safe fallbacks."""
 
-    if not pattern.strip():
-        raise ValueError("pattern must not be empty")
-
-    target = _resolve_path(path)
-    limit = _bounded_limit(max_matches, JOSHGPT_MCP_MAX_SEARCH_MATCHES)
-
-    rg_bin = shutil.which("rg")
-    if rg_bin:
-        cmd = [
-            rg_bin,
-            "--line-number",
-            "--no-heading",
-            "--color",
-            "never",
-            "--max-count",
-            str(limit),
-        ]
-        if not case_sensitive:
-            cmd.append("--ignore-case")
-        if glob.strip():
-            cmd.extend(["--glob", glob.strip()])
-        cmd.extend([pattern, str(target)])
-    else:
-        cmd = ["grep", "-RIn", pattern, str(target)]
-        if not case_sensitive:
-            cmd.insert(1, "-i")
-
-    completed = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {"path": path, "pattern": pattern},
+        correlation=correlation,
+        ctx=ctx,
     )
+    try:
+        if not pattern.strip():
+            raise ValueError("pattern must not be empty")
 
-    if completed.returncode not in (0, 1):
-        detail = (completed.stderr or completed.stdout or "").strip()
-        raise RuntimeError(f"search command failed: {detail[:400]}")
+        target = _resolve_path(path)
+        limit = _bounded_limit(max_matches, JOSHGPT_MCP_MAX_SEARCH_MATCHES)
 
-    matches: list[dict[str, Any]] = []
-    for raw_line in completed.stdout.splitlines():
-        parsed = _parse_search_output_line(raw_line)
-        if parsed is None:
-            continue
+        rg_bin = shutil.which("rg")
+        if rg_bin:
+            cmd = [
+                rg_bin,
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                "--max-count",
+                str(limit),
+            ]
+            if not case_sensitive:
+                cmd.append("--ignore-case")
+            if glob.strip():
+                cmd.extend(["--glob", glob.strip()])
+            cmd.extend([pattern, str(target)])
+        else:
+            cmd = ["grep", "-RIn", pattern, str(target)]
+            if not case_sensitive:
+                cmd.insert(1, "-i")
 
-        file_part, line_number, content = parsed
-        candidate_path = Path(file_part).resolve(strict=False)
-
-        if not _is_under_allowed_root(candidate_path):
-            continue
-        if _contains_denied_segment(candidate_path):
-            continue
-
-        matches.append(
-            {
-                "path": str(candidate_path),
-                "line": line_number,
-                "text": content,
-            }
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
         )
 
-        if len(matches) >= limit:
-            break
+        if completed.returncode not in (0, 1):
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"search command failed: {detail[:400]}")
 
-    return {
-        "pattern": pattern,
-        "path": str(target),
-        "glob": glob,
-        "case_sensitive": case_sensitive,
-        "max_matches": limit,
-        "returned": len(matches),
-        "matches": matches,
-    }
+        matches: list[dict[str, Any]] = []
+        for raw_line in completed.stdout.splitlines():
+            parsed = _parse_search_output_line(raw_line)
+            if parsed is None:
+                continue
+
+            file_part, line_number, content = parsed
+            candidate_path = Path(file_part).resolve(strict=False)
+
+            if not _is_under_allowed_root(candidate_path):
+                continue
+            if _contains_denied_segment(candidate_path):
+                continue
+
+            matches.append(
+                {
+                    "path": str(candidate_path),
+                    "line": line_number,
+                    "text": content,
+                }
+            )
+
+            if len(matches) >= limit:
+                break
+
+        response = {
+            "pattern": pattern,
+            "path": str(target),
+            "glob": glob,
+            "case_sensitive": case_sensitive,
+            "max_matches": limit,
+            "returned": len(matches),
+            "matches": matches,
+        }
+        _emit_toolhost_event(
+            event="toolhost.search_text",
+            message="Searched text under allowed path.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="search_text",
+            status="ok",
+            duration_ms=_duration_ms(started_at),
+            attrs={
+                "path": str(target),
+                "glob": glob,
+                "case_sensitive": case_sensitive,
+                "returned": len(matches),
+            },
+        )
+        return response
+    except Exception as exc:
+        _emit_toolhost_event(
+            event="toolhost.search_text",
+            message="Text search failed.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="search_text",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_code(exc),
+            attrs={"path": str(path), "glob": glob, "error": str(exc)},
+        )
+        raise
 
 
 @mcp.tool()
@@ -673,41 +878,82 @@ def run_host_command(
     cwd: str = ".",
     timeout_seconds: int | None = None,
     max_output_chars: int | None = None,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Run an allowlisted command on the MCP host with bounded timeout/output."""
 
-    _assert_mode_allows("host")
-
-    command_token, basename = _validate_command(
-        command,
-        JOSHGPT_MCP_ALLOWED_HOST_COMMANDS,
-        "host",
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {"command": command, "cwd": cwd},
+        correlation=correlation,
+        ctx=ctx,
     )
-    cleaned_args = _validate_args(args)
-    resolved_cwd = _resolve_path(cwd, expect="dir")
-    executable = shutil.which(command_token)
-    if not executable:
-        raise FileNotFoundError(f"Host command not found on PATH: {command_token!r}")
+    try:
+        _assert_mode_allows("host")
 
-    timeout = _bounded_timeout_seconds(timeout_seconds)
-    output_limit = _bounded_output_chars(max_output_chars)
+        command_token, basename = _validate_command(
+            command,
+            JOSHGPT_MCP_ALLOWED_HOST_COMMANDS,
+            "host",
+        )
+        cleaned_args = _validate_args(args)
+        resolved_cwd = _resolve_path(cwd, expect="dir")
+        executable = shutil.which(command_token)
+        if not executable:
+            raise FileNotFoundError(f"Host command not found on PATH: {command_token!r}")
 
-    result = _run_command(
-        [executable, *cleaned_args],
-        cwd=resolved_cwd,
-        timeout_seconds=timeout,
-        max_output_chars=output_limit,
-    )
+        timeout = _bounded_timeout_seconds(timeout_seconds)
+        output_limit = _bounded_output_chars(max_output_chars)
 
-    return {
-        "tool": "run_host_command",
-        "mode": JOSHGPT_MCP_TOOLS_MODE,
-        "command": basename,
-        "executable": executable,
-        "args": cleaned_args,
-        "cwd": str(resolved_cwd),
-        "result": result,
-    }
+        result = _run_command(
+            [executable, *cleaned_args],
+            cwd=resolved_cwd,
+            timeout_seconds=timeout,
+            max_output_chars=output_limit,
+        )
+
+        response = {
+            "tool": "run_host_command",
+            "mode": JOSHGPT_MCP_TOOLS_MODE,
+            "command": basename,
+            "executable": executable,
+            "args": cleaned_args,
+            "cwd": str(resolved_cwd),
+            "result": result,
+        }
+        _emit_toolhost_event(
+            event="toolhost.run_host_command",
+            message="Host command executed.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="run_host_command",
+            status="ok" if result.get("exit_code") == 0 else "error",
+            duration_ms=_duration_ms(started_at),
+            error_code="" if result.get("exit_code") == 0 else "nonzero_exit",
+            attrs={
+                "command": basename,
+                "cwd": str(resolved_cwd),
+                "exit_code": result.get("exit_code"),
+                "timed_out": result.get("timed_out"),
+                "duration_ms": result.get("duration_ms"),
+            },
+        )
+        return response
+    except Exception as exc:
+        _emit_toolhost_event(
+            event="toolhost.run_host_command",
+            message="Host command execution failed.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="run_host_command",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_code(exc),
+            attrs={"command": str(command), "cwd": str(cwd), "error": str(exc)},
+        )
+        raise
 
 
 @mcp.tool()
@@ -718,57 +964,112 @@ def run_container_command(
     workdir: str = "",
     timeout_seconds: int | None = None,
     max_output_chars: int | None = None,
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Run an allowlisted command inside an allowlisted container using docker exec."""
 
-    _assert_mode_allows("container")
-
-    validated_container = _validate_container_name(container_name)
-    command_token, basename = _validate_command(
-        command,
-        JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS,
-        "container",
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {"container_name": container_name, "command": command},
+        correlation=correlation,
+        ctx=ctx,
     )
-    cleaned_args = _validate_args(args)
-    validated_workdir = _validate_container_workdir(workdir)
+    try:
+        _assert_mode_allows("container")
 
-    docker_bin = _docker_bin()
-    if JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING:
-        _ensure_container_running(docker_bin, validated_container)
+        validated_container = _validate_container_name(container_name)
+        command_token, basename = _validate_command(
+            command,
+            JOSHGPT_MCP_ALLOWED_CONTAINER_COMMANDS,
+            "container",
+        )
+        cleaned_args = _validate_args(args)
+        validated_workdir = _validate_container_workdir(workdir)
 
-    timeout = _bounded_timeout_seconds(timeout_seconds)
-    output_limit = _bounded_output_chars(max_output_chars)
+        docker_bin = _docker_bin()
+        if JOSHGPT_MCP_REQUIRE_CONTAINER_RUNNING:
+            _ensure_container_running(docker_bin, validated_container)
 
-    docker_cmd = [docker_bin, "exec"]
-    if validated_workdir:
-        docker_cmd.extend(["-w", validated_workdir])
-    docker_cmd.append(validated_container)
-    docker_cmd.append(command_token)
-    docker_cmd.extend(cleaned_args)
+        timeout = _bounded_timeout_seconds(timeout_seconds)
+        output_limit = _bounded_output_chars(max_output_chars)
 
-    result = _run_command(
-        docker_cmd,
-        cwd=None,
-        timeout_seconds=timeout,
-        max_output_chars=output_limit,
-    )
+        docker_cmd = [docker_bin, "exec"]
+        if validated_workdir:
+            docker_cmd.extend(["-w", validated_workdir])
+        docker_cmd.append(validated_container)
+        docker_cmd.append(command_token)
+        docker_cmd.extend(cleaned_args)
 
-    return {
-        "tool": "run_container_command",
-        "mode": JOSHGPT_MCP_TOOLS_MODE,
-        "container_name": validated_container,
-        "command": basename,
-        "args": cleaned_args,
-        "workdir": validated_workdir,
-        "result": result,
-    }
+        result = _run_command(
+            docker_cmd,
+            cwd=None,
+            timeout_seconds=timeout,
+            max_output_chars=output_limit,
+        )
+
+        response = {
+            "tool": "run_container_command",
+            "mode": JOSHGPT_MCP_TOOLS_MODE,
+            "container_name": validated_container,
+            "command": basename,
+            "args": cleaned_args,
+            "workdir": validated_workdir,
+            "result": result,
+        }
+        _emit_toolhost_event(
+            event="toolhost.run_container_command",
+            message="Container command executed.",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="run_container_command",
+            status="ok" if result.get("exit_code") == 0 else "error",
+            duration_ms=_duration_ms(started_at),
+            error_code="" if result.get("exit_code") == 0 else "nonzero_exit",
+            attrs={
+                "container_name": validated_container,
+                "command": basename,
+                "workdir": validated_workdir,
+                "exit_code": result.get("exit_code"),
+                "timed_out": result.get("timed_out"),
+                "duration_ms": result.get("duration_ms"),
+            },
+        )
+        return response
+    except Exception as exc:
+        _emit_toolhost_event(
+            event="toolhost.run_container_command",
+            message="Container command execution failed.",
+            level="error",
+            correlation=resolved_correlation,
+            correlation_source=correlation_source,
+            operation="run_container_command",
+            status="error",
+            duration_ms=_duration_ms(started_at),
+            error_code=_error_code(exc),
+            attrs={
+                "container_name": str(container_name),
+                "command": str(command),
+                "error": str(exc),
+            },
+        )
+        raise
 
 
 @mcp.tool()
-def server_info() -> dict[str, Any]:
+def server_info(
+    correlation: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Expose active server limits and policy settings."""
 
-    return {
+    started_at = time.time()
+    resolved_correlation, correlation_source = _resolve_call_correlation(
+        {},
+        correlation=correlation,
+        ctx=ctx,
+    )
+    response = {
         "name": "joshgpt-mcp",
         "transport": JOSHGPT_MCP_TRANSPORT,
         "bind_host": JOSHGPT_MCP_BIND_HOST,
@@ -791,9 +1092,38 @@ def server_info() -> dict[str, Any]:
         "max_command_name_chars": JOSHGPT_MCP_MAX_COMMAND_NAME_CHARS,
         "max_arg_chars": JOSHGPT_MCP_MAX_ARG_CHARS,
     }
+    _emit_toolhost_event(
+        event="toolhost.server_info",
+        message="Server info requested.",
+        correlation=resolved_correlation,
+        correlation_source=correlation_source,
+        operation="server_info",
+        status="ok",
+        duration_ms=_duration_ms(started_at),
+        attrs={
+            "transport": JOSHGPT_MCP_TRANSPORT,
+            "bind_port": JOSHGPT_MCP_BIND_PORT,
+            "tools_mode": JOSHGPT_MCP_TOOLS_MODE,
+        },
+    )
+    return response
 
 
 if __name__ == "__main__":
+    _emit_toolhost_event(
+        event="toolhost.startup",
+        message="JoshGPT MCP toolhost service starting.",
+        correlation={"chat_session_id": "unknown", "turn_id": "unknown", "request_id": "", "tool_call_id": ""},
+        correlation_source="unknown",
+        operation="startup",
+        status="ok",
+        attrs={
+            "transport": JOSHGPT_MCP_TRANSPORT,
+            "bind_host": JOSHGPT_MCP_BIND_HOST,
+            "bind_port": JOSHGPT_MCP_BIND_PORT,
+            "tools_mode": JOSHGPT_MCP_TOOLS_MODE,
+        },
+    )
     print(
         (
             "Starting joshgpt-mcp with "
